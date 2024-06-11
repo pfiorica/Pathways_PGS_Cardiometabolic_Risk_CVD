@@ -1,0 +1,629 @@
+---
+title: "incident_tables_git"
+date: "January 25, 2024"
+output:
+  word_document: default
+  output: default
+  pdf_document: default
+---
+
+```{r program steps}
+#Program Steps: 
+# (1) Import clean cohort data (5 cohorts: overall, white, black, asian, hispanic)
+# (2) For each cohort, run Fine-Gray subdistribution hazard models (adjusted) with all-cause mortality as a competing risk. For the outcome of all-cause death, there is no competing risk. People with corresponding prevalent outcomes are excluded from the incident analyses.
+#     Exposures: 
+#         1. 33 polygenic scores (standardized to mean of 0 and standard deviation of 1 within each race)
+#     Outcomes (all incident): 
+#         1. Any CMD risk factor
+#         2. Hypertension
+#         3. Diabetes
+#         4. Dyslipidemia
+#         5. Any CVD
+#         6. Serious CVD
+#         7. Arrhythmia
+#         8. Heart Failure/Cardiomyopathy
+#         9. Ischemic heart disease
+#         10. Stroke
+#         11. Venous thromboembolic disease 
+#         12. CVD-related death 
+#         13. All-cause death (no competing risk)
+#     Covariates for adjusted models: 
+#         -Diagnosis age (dxage) (continuous) 
+#         -Baseline income (bl_inc_cat2)
+#         -Baseline education (bl_educlvl_5cat) 
+#         -Baseline BMI (bmi_new) (continuous) 
+#         -Baseline menopausal status (bl_meno_status)
+#         -Smoking status (smoke_status_6m)
+#         -Primary care utilization (pc_util_count) (continuous)  
+#         -CVD risk factors (prev_anycvd) - only if running CMD outcome models
+#         -CMD risk factors (prev_any_cmd) - only if running CVD outcome models
+#         -Radiation (rad_tx_yn)
+#         -Anthracyclines (anthra_yn)
+#         -Anti-HER2 therapy (tras_yn) 
+#         -Endocrine therapy (horm_yn)
+#     **In the adjusted models, if the proportional hazards assumption is violated for any covariate besides age, then adjust for that covariate interacted with time. If the covariate is continuous, interact the covariate with the log of time. If the outcome is all-cause death, adjust for both prev_anycvd and prev_anycmd.**
+```
+
+```{r install packages and libraries, include=F}
+packages <- c("dplyr", "ggplot2", "lubridate", "DBI", "vaultr", "skimr", "haven", "janitor", 
+              "readr", "stringr", "modeest", "here", "kableExtra", "flextable", "stringi", 
+              "tidyr", "stats", "fANCOVA", "forecast", "xts", "growthcleanr", "readxl", 
+              "survival", "survminer", "cmprsk", "gtsummary", "officer", 
+              "broom")
+lapply(packages, library, character.only = TRUE)
+```
+
+```{r import clean datasets}
+#import full cohort PGS zscores
+zscores_overall <- read_rds(here("pgs",
+                                 "data",
+                                 "final_cohorts",
+                                 "pgs_zscores_overall.rds"))
+
+#import white PGS zscores
+zscores_white <- read_rds(here("pgs",
+                               "data",
+                               "final_cohorts",
+                               "pgs_zscores_white.rds"))
+
+#import black PGS zscores
+zscores_black <- read_rds(here("pgs",
+                               "data",
+                               "final_cohorts",
+                               "pgs_zscores_black.rds"))
+
+#import asian PGS zscores
+zscores_asian <- read_rds(here("pgs",
+                               "data",
+                               "final_cohorts",
+                               "pgs_zscores_asian.rds"))
+
+#import hispanic PGS zscores
+zscores_hispanic <- read_rds(here("pgs",
+                                  "data",
+                                  "final_cohorts",
+                                  "pgs_zscores_hispanic.rds"))
+```
+
+```{r create function to run adjusted models except for all cause death outcome}
+#this function can be used for all outcomes, except all-cause death (because there is no competing risk and the covariates are different)
+#create function to run adjusted models
+models1 = function(time_var, out_var, df, pgs_var, outcome_string) {
+  
+  #exclude prevalent conditions 
+  df_filter <- df %>% filter(!!as.symbol(out_var)!=3) 
+  
+  #create Fine & Gray dataset
+  data_fg <- finegray(as.formula(paste0("Surv(", time_var, ",", out_var, ") ~ .")), 
+                      data=df_filter) 
+  
+  #create list of continuous covariates 
+  cov_cont <- c("bmi_new", "pc_util_count")
+  
+  #run initial adjusted models
+  #if the outcome is cardiometabolic related, adjust for prev_anycvd
+  #if the outcome is not cardiometabolic related, adjust for prev_anycmd
+  if(out_var %in% c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid")) 
+  {adj_model1 <- coxph(as.formula(paste0("Surv(fgstart, fgstop, fgstatus) ~", pgs_var, "+ dxage + bl_inc_cat2 + bl_educlvl_5cat + bmi_new + bl_meno_status + smoke_status_6m + pc_util_count + prev_anycvd + rad_tx_yn + anthra_yn + tras_yn + horm_yn")), 
+                      weight=fgwt, data=data_fg, 
+                      robust=F)}
+  if(!out_var %in% c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid")) 
+  {adj_model1 <- coxph(as.formula(paste0("Surv(fgstart, fgstop, fgstatus) ~", pgs_var, "+ dxage + bl_inc_cat2 + bl_educlvl_5cat + bmi_new + bl_meno_status + smoke_status_6m + pc_util_count + prev_anycmd + rad_tx_yn + anthra_yn + tras_yn + horm_yn")), 
+                      weight=fgwt, data=data_fg, 
+                      robust=F)}
+  
+  #assess proportional hazards assumption 
+  #if cox.zph produces an error, keep initial adjusted model 
+  #if cox.zph does not produce an error, extract the covariates for which p < 0.05 and re-run adjusted models with the covariate interacted with time. If the covariate is continuous interact the covariate with the log of time. 
+  ph_vars <- tryCatch(
+                {as.data.frame(cox.zph(adj_model1)$table) %>% 
+                 tibble::rownames_to_column(var = "variable") %>% 
+                 filter(!variable %in% c("dxage", pgs_var, "GLOBAL")) %>%
+                 mutate(outcome = out_var,
+                        violation = 
+                          case_when(p < 0.0500 ~ "PH violations", 
+                                    TRUE ~ "no PH violations"), 
+                        status = 
+                          case_when(any(violation=="PH violations") ~ "PH violations", 
+                                    TRUE ~ "no PH violations")) %>% 
+                 filter(violation == "PH violations") %>% 
+                 select(outcome, variable, status) %>% 
+                 mutate(var = paste0("var", row_number()), 
+                        cov1 = "dxage", 
+                        cov2 = "pc_util_count", 
+                        cov3 = "bl_inc_cat2", 
+                        cov4 = "bl_educlvl_5cat", 
+                        cov5 = "bmi_new", 
+                        cov6 = "bl_meno_status", 
+                        cov7 = "smoke_status_6m", 
+                        cov8 = "rad_tx_yn", 
+                        cov9 = "anthra_yn", 
+                        cov10 = "tras_yn", 
+                        cov11 = "horm_yn", 
+                        cov12 = 
+                          case_when(outcome %in% c("inc_anycmd", "inc_hyperten", 
+                                                   "inc_diabetes", "inc_dyslipid") ~ "prev_anycvd", 
+                                    TRUE~"prev_anycmd")) %>% 
+                  mutate(across(cov1:cov12, 
+                         ~case_when(variable %in% . ~ as.character(NA), 
+                                         TRUE~.))) %>% 
+                  group_by(outcome) %>% 
+                  mutate_at(vars(cov1:cov12), 
+                             ~case_when(any(is.na(.)) ~ as.character(NA), 
+                                        TRUE~.)) %>% 
+                  mutate(variable = paste0("tt(", variable, ")"), 
+                         ph_vars = paste(variable, collapse = "+")) %>%
+                  ungroup() %>% 
+                  unite("covariates1", cov1:cov12, 
+                        sep=" + ", na.rm=T) %>% 
+                  unite("covariates", c(covariates1, ph_vars), 
+                        sep=" + ") %>% 
+                  distinct(outcome, .keep_all=T) %>% 
+                  select(outcome, status, covariates) 
+                  },
+                #if an error occurs when testing the proportional hazards assumption, create an empty dataset of variables to adjust for (ie. keep the initial adjusted model)
+                error = function(e) 
+                  {
+                  ph_vars <- data.frame(matrix(ncol = 0, nrow = 0))
+                } 
+                )
+  
+   #flag if the adjusted model should be re-run
+   if(nrow(ph_vars)==0) 
+     {ph_vars_flag <- c("do not rerun")} 
+   else {ph_vars_flag <- c("rerun")}
+     
+  #re-run adjusted models 
+  if(ph_vars_flag=="do not rerun")
+  {adj_final1 <- adj_model1}
+
+  else
+  {#create list of covariates
+    covariates_string <- ph_vars %>% pull(covariates)
+  
+  #create list of tt() terms
+  var_int <- names(which(cox.zph(adj_model1)$table[, "p"] < 0.05))
+  var_int <- var_int[!var_int %in% c("dxage", pgs_var, "GLOBAL")]
+  
+  #create function for tt() terms in adjusted models
+  #if covariate is categorical multiply by time; if covariate is continuous multiply by the log of time
+  function_list <- list()
+    for (variable in 1:length(var_int)) {
+           if (var_int[variable] %in% cov_cont) {
+                  function_list[[variable]] <- function(x,t,...) {x*log(t)}} 
+           else {
+                  function_list[[variable]] <- function(x, t,...) {
+                    m <- model.matrix(~x)[, -1]
+                    m*t}
+              }
+    }
+  
+  #re-run model with tt() terms
+   adj_final1 <- coxph(as.formula(paste0("Surv(fgstart, fgstop, fgstatus) ~", pgs_var, "+", covariates_string)),
+                       weight=fgwt, data=data_fg,
+                       robust=F,
+                       tt=function_list)
+  }
+
+  #clean final adjusted model
+  adj_model_clean <- adj_final1 %>% tidy(conf.int = TRUE, 
+                                         exponentiate = TRUE) %>% 
+                     select(term, estimate, starts_with("conf"), p.value) %>% 
+                     mutate_at(vars(estimate, conf.low, conf.high), 
+                               ~round(.,2)) %>%
+                     filter(term==paste0({{pgs_var}})) %>% 
+                     mutate(estimate = paste0(estimate, " (", conf.low, ",", conf.high, ")"), 
+                            outcome=outcome_string) %>%
+                     rename(adj_est = estimate, 
+                            adj_p = p.value) %>% 
+                     select(term, outcome, adj_est, adj_p)
+  
+  #print model results
+  adj_model_clean
+}
+```
+
+```{r create function to run adjusted models with all cause death outcome}
+#this function can be used for only the all-cause death outcome (because there is no competing risk and the covariates are different)
+#create function to run adjusted models
+models2 = function(time_var, out_var, df, pgs_var, outcome_string) {
+  
+  #create list of continuous covariates 
+  cov_cont <- c("bmi_new", "pc_util_count")
+  
+  #run initial adjusted model
+  #because the outcome is overall death, adjust for both prev_anycvd and prev_anycmd
+  adj_model1 <- coxph(as.formula(paste0("Surv(", time_var, ",", out_var, ") ~ ", pgs_var, "+ dxage + bl_inc_cat2 + bl_educlvl_5cat + bmi_new + bl_meno_status + smoke_status_6m + pc_util_count + prev_anycvd + prev_anycmd + rad_tx_yn + anthra_yn + tras_yn + horm_yn")), data=df)
+
+  #assess proportional hazards assumption 
+  #if cox.zph produces an error, keep initial adjusted model 
+  #if cox.zph does not produce an error, extract the covariates for which p < 0.05 and re-run adjusted models with the covariate interacted with time. If the covariate is continuous interact the covariate with the log of time. 
+  ph_vars <- tryCatch(
+                {as.data.frame(cox.zph(adj_model1)$table) %>% 
+                 tibble::rownames_to_column(var = "variable") %>% 
+                 filter(!variable %in% c("dxage", pgs_var, "GLOBAL")) %>%
+                 mutate(outcome = out_var,
+                        violation = 
+                          case_when(p < 0.0500 ~ "PH violations", 
+                                    TRUE ~ "no PH violations"), 
+                        status = 
+                          case_when(any(violation=="PH violations") ~ "PH violations", 
+                                    TRUE ~ "no PH violations")) %>% 
+                 filter(violation == "PH violations") %>% 
+                 select(outcome, variable, status) %>% 
+                 mutate(var = paste0("var", row_number()), 
+                        cov1 = "dxage", 
+                        cov2 = "pc_util_count", 
+                        cov3 = "bl_inc_cat2", 
+                        cov4 = "bl_educlvl_5cat", 
+                        cov5 = "bmi_new", 
+                        cov6 = "bl_meno_status", 
+                        cov7 = "smoke_status_6m", 
+                        cov8 = "rad_tx_yn", 
+                        cov9 = "anthra_yn", 
+                        cov10 = "tras_yn", 
+                        cov11 = "horm_yn", 
+                        cov12 = "prev_anycvd", 
+                        cov13 = "prev_anycmd") %>% 
+                  mutate(across(cov1:cov13, 
+                         ~case_when(variable %in% . ~ as.character(NA), 
+                                         TRUE~.))) %>% 
+                  group_by(outcome) %>% 
+                  mutate_at(vars(cov1:cov13), 
+                             ~case_when(any(is.na(.)) ~ as.character(NA), 
+                                        TRUE~.)) %>% 
+                  mutate(variable = paste0("tt(", variable, ")"), 
+                         ph_vars = paste(variable, collapse = "+")) %>%
+                  ungroup() %>% 
+                  unite("covariates1", cov1:cov13, 
+                        sep=" + ", na.rm=T) %>% 
+                  unite("covariates", c(covariates1, ph_vars), 
+                        sep=" + ") %>% 
+                  distinct(outcome, .keep_all=T) %>% 
+                  select(outcome, status, covariates) 
+                  },
+                #if an error occurs when testing the proportional hazards assumption, create an empty dataset of variables to adjust for (ie. keep the initial adjusted model)
+                error = function(e) 
+                  {
+                  ph_vars <- data.frame(matrix(ncol = 0, nrow = 0))
+                } 
+                )
+  
+   #flag if the adjusted model should be re-run
+   if(nrow(ph_vars)==0) 
+     {ph_vars_flag <- c("do not rerun")} 
+   else {ph_vars_flag <- c("rerun")}
+     
+  #re-run adjusted models 
+  if(ph_vars_flag=="do not rerun")
+  {adj_final1 <- adj_model1}
+
+  else
+  {#create list of covariates
+    covariates_string <- ph_vars %>% pull(covariates)
+  
+  #create list of tt() terms
+  var_int <- names(which(cox.zph(adj_model1)$table[, "p"] < 0.05))
+  var_int <- var_int[!var_int %in% c("dxage", pgs_var, "GLOBAL")]
+  
+  #create function for tt() terms in adjusted models
+  #if covariate is categorical multiply by time; if covariate is continuous multiply by the log of time
+  function_list <- list()
+    for (variable in 1:length(var_int)) {
+           if (var_int[variable] %in% cov_cont) {
+                  function_list[[variable]] <- function(x,t,...) {x*log(t)}} 
+           else {
+                  function_list[[variable]] <- function(x, t,...) {
+                    m <- model.matrix(~x)[, -1]
+                    m*t}
+              }
+    }
+  
+  #re-run model with tt() terms
+   adj_final1 <- coxph(as.formula(paste0("Surv(", time_var, ",", out_var, ") ~ ", pgs_var, "+", covariates_string)),
+                       data=df,
+                       tt=function_list)
+  }
+
+  #clean final adjusted model
+  adj_model_clean <- adj_final1 %>% tidy(conf.int = TRUE, 
+                                         exponentiate = TRUE) %>% 
+                     select(term, estimate, starts_with("conf"), p.value) %>% 
+                     mutate_at(vars(estimate, conf.low, conf.high), 
+                               ~round(.,2)) %>%
+                     filter(term==paste0({{pgs_var}})) %>% 
+                     mutate(estimate = paste0(estimate, " (", conf.low, ",", conf.high, ")"), 
+                            outcome=outcome_string) %>%
+                     rename(adj_est = estimate, 
+                            adj_p = p.value) %>% 
+                     select(term, outcome, adj_est, adj_p)
+  
+  #print model results
+  adj_model_clean
+}
+```
+
+```{r apply function to create tables for all outcomes except all cause death}
+#create function input variables for models1 function
+#time variables
+times <- c(rep("inc_anycmd_time", 33), 
+           rep("inc_hyperten_time", 33), 
+           rep("inc_diabetes_time", 33), 
+           rep("inc_dyslipid_time", 33),
+           rep("inc_anycvd_time", 33), 
+           rep("inc_seriouscvd_time", 33),
+           rep("inc_arrhythmia_time", 33), 
+           rep("inc_hf_time", 33), 
+           rep("inc_ischemic_time", 33), 
+           rep("inc_stroke_time", 33), 
+           rep("inc_vte_time", 33), 
+           rep("inc_cvddeath_time", 33))
+
+#outcome variables
+outcomes <- c(rep("inc_anycmd", 33), 
+              rep("inc_hyperten", 33), 
+              rep("inc_diabetes", 33), 
+              rep("inc_dyslipid", 33), 
+              rep("inc_anycvd", 33), 
+              rep("inc_seriouscvd", 33), 
+              rep("inc_arrhythmia", 33), 
+              rep("inc_hf", 33),
+              rep("inc_ischemic", 33), 
+              rep("inc_stroke", 33), 
+              rep("inc_vte", 33), 
+              rep("inc_cvddeath", 33))
+
+#PGS scores
+pgs<- c(rep(c("z_pgs_angina", "z_pgs_apolipoprotein_a", "z_pgs_apolipoprotein_b",
+              "z_pgs_atrial_fibrillation", "z_pgs_body_fat_percentage", 
+              "z_pgs_body_mass_index_adult", "z_pgs_body_mass_index_early_life", 
+              "z_pgs_body_weight", "z_pgs_c_reactive_protein", 
+              "z_pgs_cad2", "z_pgs_cad3", "z_pgs_cad3725", 
+              "z_pgs_cardiovascular_disease", "z_pgs_coronary_heart_disease", 
+              "z_pgs_diabetes", "z_pgs_diastolic_blood_pressure", 
+              "z_pgs_fasting_glucose", "z_pgs_fasting_glucose_adjusted_for_bmi", 
+              "z_pgs_hb_a1c", "z_pgs_hdl_cholesterol", "z_pgs_heart_failure", 
+              "z_pgs_hypertension", "z_pgs_ischaemic_stroke", 
+              "z_pgs_ldl_cholesterol", "z_pgs_lipoprotein_a",
+              "z_pgs_myocardial_infarction", "z_pgs_non_fasting_glucose", 
+              "z_pgs_sbp", "z_pgs_systolic_blood_pressure", 
+              "z_pgs_total_cholesterol", "z_pgs_triglyceride", 
+              "z_pgs_type_2_diabetes", "z_pgs_waist_circumference"), 12))
+
+#outcome strings
+outcome_strings  <- c(rep("Any CMD risk factor", 33), 
+                      rep("Hypertension", 33), 
+                      rep("Diabetes", 33), 
+                      rep("Dyslipidemia", 33), 
+                      rep("Any CVD", 33), 
+                      rep("Serious CVD", 33), 
+                      rep("Arrhythmia", 33), 
+                      rep("Heart failure or cardiomyopathy", 33),
+                      rep("Ischemic heart disease", 33), 
+                      rep("Stroke", 33), 
+                      rep("VTE", 33), 
+                      rep("CVD-related death", 33))
+
+#create list of arguments for full cohort 
+model_args_overall = list(c(times),
+                          c(outcomes),
+                          c(rep(list(zscores_overall), 396)),
+                          c(pgs),
+                          c(outcome_strings))
+
+#create list of arguments for white cohort 
+model_args_white = list(c(times),
+                        c(outcomes),
+                        c(rep(list(zscores_white), 396)),
+                        c(pgs),
+                        c(outcome_strings))
+
+#create list of arguments for black cohort 
+model_args_black = list(c(times),
+                        c(outcomes),
+                        c(rep(list(zscores_black), 396)),
+                        c(pgs),
+                        c(outcome_strings))
+
+#create list of arguments for asian cohort
+model_args_asian = list(c(times),
+                        c(outcomes),
+                        c(rep(list(zscores_asian), 396)),
+                        c(pgs),
+                        c(outcome_strings))
+
+#create list of arguments for hispanic cohort
+model_args_hispanic = list(c(times),
+                           c(outcomes),
+                           c(rep(list(zscores_hispanic), 396)),
+                           c(pgs),
+                           c(outcome_strings))
+
+#apply function to create tables
+table_overall <- bind_rows(purrr::pmap(model_args_overall, models1))
+table_white <- bind_rows(purrr::pmap(model_args_white, models1))
+table_black <- bind_rows(purrr::pmap(model_args_black, models1))
+table_asian <- bind_rows(purrr::pmap(model_args_asian, models1))
+table_hispanic <- bind_rows(purrr::pmap(model_args_hispanic, models1))
+
+#check work by running some test models manually
+# data_fg <- finegray(Surv(inc_stroke_time, inc_stroke) ~ .,
+#                    data=zscores_overall)
+# adj_model <- coxph(Surv(fgstart, fgstop, fgstatus) ~ z_pgs_systolic_blood_pressure + dxage + bmi_new + bl_inc_cat2 + bl_educlvl_5cat + bl_meno_status + smoke_status_6m + pc_util_count + prev_anycmd + rad_tx_yn + anthra_yn + tras_yn + horm_yn, weight=fgwt, data=data_fg,
+#                    robust=F)
+# cox.zph(adj_model)
+# adj_model
+```
+
+```{r apply function to create tables for all cause death outcome}
+#create function input variables for models2 function
+#time variables
+times_death <- c(rep("inc_death_time", 33))
+
+#outcome variables
+outcomes_death <- c(rep("inc_death", 33))
+
+#PGS scores
+pgs_death <- c("z_pgs_angina", "z_pgs_apolipoprotein_a", "z_pgs_apolipoprotein_b",
+               "z_pgs_atrial_fibrillation", "z_pgs_body_fat_percentage", 
+               "z_pgs_body_mass_index_adult", "z_pgs_body_mass_index_early_life", 
+               "z_pgs_body_weight", "z_pgs_c_reactive_protein", 
+               "z_pgs_cad2", "z_pgs_cad3", "z_pgs_cad3725", 
+               "z_pgs_cardiovascular_disease", "z_pgs_coronary_heart_disease", 
+               "z_pgs_diabetes", "z_pgs_diastolic_blood_pressure", 
+               "z_pgs_fasting_glucose", "z_pgs_fasting_glucose_adjusted_for_bmi", 
+               "z_pgs_hb_a1c", "z_pgs_hdl_cholesterol", "z_pgs_heart_failure", 
+               "z_pgs_hypertension", "z_pgs_ischaemic_stroke", 
+               "z_pgs_ldl_cholesterol", "z_pgs_lipoprotein_a",
+               "z_pgs_myocardial_infarction", "z_pgs_non_fasting_glucose", 
+               "z_pgs_sbp", "z_pgs_systolic_blood_pressure", 
+               "z_pgs_total_cholesterol", "z_pgs_triglyceride", 
+               "z_pgs_type_2_diabetes", "z_pgs_waist_circumference")
+
+#outcome strings
+outcome_strings_death  <- c(rep("Overall death", 33))
+
+#create list of arguments for full cohort
+model_args_overall_death = list(c(times_death),
+                                c(outcomes_death),
+                                c(rep(list(zscores_overall), 33)),
+                                c(pgs_death),
+                                c(outcome_strings_death))
+
+#create list of arguments for white cohort
+model_args_white_death = list(c(times_death),
+                              c(outcomes_death),
+                              c(rep(list(zscores_white), 33)),
+                              c(pgs_death),
+                              c(outcome_strings_death))
+
+#create list of arguments for black cohort
+model_args_black_death = list(c(times_death),
+                              c(outcomes_death),
+                              c(rep(list(zscores_black), 33)),
+                              c(pgs_death),
+                              c(outcome_strings_death))
+
+#create list of arguments for asian cohort
+model_args_asian_death = list(c(times_death),
+                              c(outcomes_death),
+                              c(rep(list(zscores_asian), 33)),
+                              c(pgs_death),
+                              c(outcome_strings_death))
+
+#create list of arguments for hispanic cohort
+model_args_hispanic_death = list(c(times_death),
+                                 c(outcomes_death),
+                                 c(rep(list(zscores_hispanic), 33)),
+                                 c(pgs_death),
+                                 c(outcome_strings_death))
+
+#apply function to create tables
+table_overall_death <- bind_rows(purrr::pmap(model_args_overall_death, models2))
+table_white_death <- bind_rows(purrr::pmap(model_args_white_death, models2))
+table_black_death <- bind_rows(purrr::pmap(model_args_black_death, models2))
+table_asian_death <- bind_rows(purrr::pmap(model_args_asian_death, models2))
+table_hispanic_death <- bind_rows(purrr::pmap(model_args_hispanic_death, models2))
+
+#check work by running some test models manually
+# adj_model <- coxph(Surv(inc_death_time, inc_death) ~ 	z_pgs_cad3 + dxage + bmi_new + bl_inc_cat2 + bl_educlvl_5cat + tt(bl_meno_status) + smoke_status_6m + pc_util_count + tt(prev_anycmd) + prev_anycvd + rad_tx_yn + tt(anthra_yn) + tras_yn + tt(horm_yn),
+#                    data=zscores_hispanic, 
+#                    tt=function(x,time,...){matrix <- model.matrix(~x)[,-1];matrix*time})
+# cox.zph(adj_model)
+# adj_model
+```
+
+```{r clean results and combine outcomes}
+#rename variables for each cohort 
+table_overall2 <- rbind(table_overall, 
+                        table_overall_death) %>% 
+                  rename(hr_overall = adj_est, 
+                         p_overall = adj_p)
+
+table_white2 <- rbind(table_white, 
+                      table_white_death) %>% 
+                rename(hr_white = adj_est, 
+                       p_white = adj_p)
+
+table_black2 <- rbind(table_black, 
+                      table_black_death) %>% 
+                rename(hr_black = adj_est, 
+                       p_black = adj_p)
+  
+table_asian2 <- rbind(table_asian, 
+                      table_asian_death) %>% 
+                rename(hr_asian = adj_est, 
+                       p_asian = adj_p) 
+
+table_hispanic2 <- rbind(table_hispanic, 
+                         table_hispanic_death) %>% 
+                   rename(hr_hispanic = adj_est, 
+                          p_hispanic = adj_p)  
+
+#combine overall death outcomes and other outcomes 
+table_all <- table_overall2 %>% left_join(table_white2, 
+                                          by=c("term", "outcome")) %>% 
+                                left_join(table_black2, 
+                                          by=c("term", "outcome")) %>% 
+                                left_join(table_asian2, 
+                                          by=c("term", "outcome")) %>% 
+                                left_join(table_hispanic2, 
+                                          by=c("term", "outcome"))
+
+#save table of results as .rds
+write_rds(table_all, here("pgs", 
+                          "data", 
+                          "results_data", 
+                          "all_results.rds"))
+
+```
+
+```{r export table}
+#table properties
+sect_properties <-  prop_section(page_size = page_size(orient = "landscape", 
+                                                       width = 11.7, 
+                                                       height = 8.3),
+                                 type = "continuous", 
+                                 page_margins = page_mar())
+
+#save table as flextable
+table_f <- flextable(table_all)
+
+#export table
+# save_as_docx(table_f,
+#              path=here("pgs",
+#                        "output",
+#                        "table_draft.docx"),
+#              pr_section=sect_properties)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+`
+
+
+
+
+
+
+
+
+
