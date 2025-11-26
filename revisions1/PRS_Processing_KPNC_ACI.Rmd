@@ -1,0 +1,1813 @@
+---
+title: "PGS_Processing Notes"
+output: html_document
+date: "2025-04-23"
+---
+
+```{r, echo = FALSE}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(ggsci)
+
+"%&%"=function(a,b) paste(a,b,sep="")
+
+dir <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+```
+
+# Introduction
+
+This document serves as my notes for performing the updated PGS analyses on KPNC ACI. Previously, I set these scripts up to run on an HPC Cluster with a SLURM or torque scheduler, but that is not the computing infrastructure I am using at KPNC. Instead, I will be updating the code to run on simpler sessions of Rstudio and Linux.
+
+Additionally, I will be picking up with the script `03_process_phenotype.R`. The scripts before this entail the processing of genotypes, PGS calculation, and PGS processing.  
+
+# Phenotype Processing
+
+The goal of `03_process_phenotype.R` is to update the BMI, income, and education coding. After this, all the phenotypic information is joined to the genotype information in the PGS. It will then write one large phenotype file, individual phenotype files, and then one large phenotype file with the covariates. It then does all of these for the ancestry-specific information.
+
+It looks like Ally already joined the PGS to the phenotype data in the files located at `/bd-fs-mnt/TenantShare/exthome/home/l578311/cvd/pgs_revised/data/final_cohorts/`.
+
+# Pull PGS Outcomes
+
+For the fourth script, I had to have Janise copy some additional files and folders from CCR to KPNC. This script updates some phenotype names and formats the PGS into PGS number rather than the trait name.
+
+# Run PRSMix
+
+I realized in this previous step that I was only using the phenotypic (STUDYIDs) and not the genotype information. I shared a Genotype map file with Janise, and changed the names in the phenotype to be the genotypic ID that is used for all the PGS information. 
+
+From here, I re-ran step `03_KPNC_process_phenotype.R` with a couple lines to update this. From there, I re-ran the `04` script. I then make `04_KPNC_call_ancestry_PRSMix.sh` which runs the analyses for all 5 groups in series. 
+
+
+The code appears to run without syntax or file errors, but I am getting the error:
+
+```
+Aggregating results
+Something is wrong; all Accuracy metric vaues are missing:
+```
+
+Then all the values are NA or NaN. I discovered this because there are "2"s and "3"s coded in the phenotypes. When I revisited the data dictionary, Ally put these for when someone died before developing the phenotype (2) or had a prevalent phenotype at the time of diagnosis (3).
+
+
+## Troubleshooting PRSMix
+
+When I look through the log files, there are different errors that come up. For example, in `ALL_inc_dyslipid.log`, the error is:
+
+```
+Error in na.fail.default(list(trait = c(2L, 2L, 1L, 1L, 1L, 2L, 2L, 2L,  : 
+  missing values in object
+Calls: combine_PRS ... model.frame.default -> <Anonymous> -> na.fail.default
+Execution halted
+```
+
+When I check through these, I find that the lines 302-313 of the `combine_PRS` script where where the `train()` function is used may be causing the error.
+
+Additionally, I find that in `EUR_inc_anycmd.log`, there is the different error:
+
+```
+Error in roc.default(response, predictor, ci = FALSE, ...) : 
+  Response and predictor must be vectors of the same length.
+Calls: combine_PRS -> ci.auc -> ci.auc.default -> roc.default
+In addition: Warning message:
+In for (i in 1:length(args)) { :
+  closing unused connection 4 (<-localhost:11988)
+Execution halted
+```
+
+This may be from an error at line 320 of the `combine_PRS()` script.
+
+
+
+Let's start with the first error:
+
+
+```{r, eval = FALSE}
+covariate_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/ALL__covariates.txt"
+basic_data = fread(covariate_file)
+
+train_df <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_results/ALL_inc_dyslipid_train_df.txt", header = T)
+
+categorical_vars<- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+IID_pheno <- c("IID")
+
+covar_list <- c(categorical_vars, continuous_vars)
+
+basic_data = fread(covariate_file)
+basic_data = basic_data[, c(IID_pheno, covar_list)]
+
+basic_data <- basic_data %>% filter(!is.na(bmi_new))
+
+train_tmp <- merge(train_df, basic_data, by="IID")
+
+train_tmp$trait = as.factor(train_tmp$trait)
+formula_null = as.formula(paste0("trait ~ ", paste0(covar_list, 
+  collapse = "+")))
+
+nfold_cv = 3
+ncores=1
+ctrl = trainControl(method = "repeatedcv", allowParallel = TRUE, 
+  number = nfold_cv, returnData = FALSE, trim = T, 
+  verboseIter = T)
+cl = makePSOCKcluster(ncores)
+cl = makeCluster(ncores)
+registerDoParallel(cl)
+set.seed(123)
+model_prsmix_null = train(formula_null, data = train_tmp, 
+  method = "glmnet", trControl = ctrl, family = "binomial", 
+  tuneLength = 50, verbose = T)
+
+
+formula_null = as.formula(paste0("trait ~", paste0(covar_list, collapse = "+")))
+
+model_prsmix_null = train(
+  formula_null, data = train_tmp, method = "glmnet",
+  trControl = ctrl, family = "binomial",
+  tuneLength = 50, verbose = T
+)
+
+```
+
+This was resolved by removing the `NA` from `bmi_new`. After resolving this error. The other error went away... But, a new one showed up:
+
+In all the `inc_anycmd`, there is the issue:
+
+```
+--- Reading covariate data ---
+Generating dummy variables from categorical variables
+Error in top_vals$vals : $ operator is invalid for atomic vectors
+Calls: combine_PRS ... make_dummy_columns -> dummy_cols -> <Anonymous> -> stri_order
+In addition: Warning messages:
+1: In max(vals$Freq) : no non-missing arguments to max; returning -Inf
+2: In max(vals$Freq) : no non-missing arguments to max; returning -Inf
+Execution halted
+```
+
+
+```{r, echo = FALSE, eval = FALSE}
+#COVARIATE
+categorical_vars<- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+covariates <- c(categorical_vars, continuous_vars)
+
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_file_paths.txt", header =F)$V1 
+
+pgs_list <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_PGS_list.txt", header = F)
+num_pgs <- nrow(pgs_list)
+
+#print("Processing the phenotype: " %&% args$pheno_name %&%" ; Number of PGS Corresponding to it: " %&% num_pgs)
+
+combine_PRS(
+  pheno_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/ALL_inc_anycmd_phenotype.txt" ,
+  covariate_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/ALL_inc_anycmd_covariates.txt" ,
+  score_files_list = scores_file_vector ,
+  trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_file_paths.txt" ,
+  pheno_name = "inc_anycmd" ,
+  isbinary = TRUE , 
+  out = "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test", 
+  liabilityR2 = TRUE ,
+  IID_pheno =  "IID" ,
+  covar_list = covariates,
+  cat_covar_list = categorical_vars,
+  is_extract_adjSNPeff = FALSE,
+  train_size_list = NULL,
+  #power_thres_list = 0.95,
+  pval_thres_list = 0.05/7,
+  read_pred_training = FALSE,
+  read_pred_testing = FALSE,
+  original_beta_files_list = "/bd-fs-mnt/TenantShare/exthome/home/l578311/janise_share/weights.txt"
+)
+
+covariate_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/ALL_inc_anycmd_covariates.txt"
+IID_pheno="IID"
+covar_list = covariates
+cat_covar_list = categorical_vars
+options(datatable.fread.datatable = FALSE)
+#writeLines("--- Reading covariate data ---")
+basic_data = fread(covariate_file)
+basic_data = basic_data[, c(IID_pheno, covar_list)]
+if (length(cat_covar_list) > 0) {
+  writeLines("Generating dummy variables from categorical variables")
+  basic_data_list = make_dummy_columns(basic_data, cat_covar_list)
+  covar_list = covar_list[-match(cat_covar_list, covar_list)]
+  covar_list = c(covar_list, basic_data_list[[2]])
+  basic_data = basic_data_list[[1]]
+}
+
+df = basic_data
+dummy_colnames = NULL
+for (cat_covar_i in 1:length(cat_covar_list)) {
+  print(cat_covar_i)
+  cat_covar = cat_covar_list[cat_covar_i]
+  df = df[which(!is.na(df[, cat_covar])), ]
+  df = dummy_cols(df, select_columns = cat_covar, remove_selected_columns = T, 
+    remove_most_frequent_dummy = T)
+  dummy_colnames_tmp = colnames(df)[which(startsWith(colnames(df), 
+    cat_covar))]
+  dummy_colnames = c(dummy_colnames, dummy_colnames_tmp)
+}
+return(list(df = df, dummy_names = dummy_colnames))
+```
+
+The issue above was addressed by fixing the phenotype file processing step. The prev_anycmd was being used for the inc_anycmd phenotype. This created issues because these individuals had to have no previous history.
+
+# PRSMix Results
+
+## Compare Accuracy
+```{r}
+pgs_dir<-"/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+file_directory <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_results"
+file_list <- list.files(file_directory, pattern = "*_summary_traitPRS_withPRSmixPlus.txt", full.names = TRUE)
+pheno_list <- c()
+
+for (file in file_list) {
+  phenotype <- sub(".*/(.*?)_power.0.95_pthres.0.00714285714285714_test_summary_traitPRS_withPRSmixPlus.txt", "\\1", file)
+  pheno_list <- c(pheno_list, phenotype)
+}
+
+auc_pgs <- data.table()
+auc_null <- data.table()
+for (pheno in pheno_list){
+  #AUC
+  a_auc_pgs <- fread(pgs_dir %&% "prsmix_results/" %&% pheno %&% "_auc_BestPGS.txt", header = T)
+  a_auc_pgs$pheno <- pheno
+  a_auc_null <- fread(pgs_dir %&% "prsmix_results/" %&% pheno %&% "_auc_NULL.txt", header = T)
+  a_auc_null$pheno <- pheno
+  
+  auc_pgs <- bind_rows(auc_pgs, a_auc_pgs)
+  auc_null <- bind_rows(auc_null, a_auc_null)
+  
+  # ACCURACY
+  
+  
+}
+auc_comp <- bind_rows(auc_pgs, auc_null)
+```
+
+```{r}
+ggplot(auc_comp, aes(x = auc, y = pheno, fill = method)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +  # Horizontal bars with borders
+  geom_errorbar(aes(xmin = lowerCI, xmax = upperCI), 
+                width = 0.3,  # Width of the error bar ends
+                position = position_dodge(width = 0.9)) +  # Dodge to align with bars
+  geom_text(aes(label = round(auc, 3), x = auc - .1),  # Add labels slightly to the right
+        position = position_dodge(width = 0.9),    # Align with bars
+        size = 4,                                  # Adjust text size
+        hjust = 1) +
+  labs(
+    x = "AUC",
+    y = "Phenotype",
+    title = "AUC for Phenotypes by Method"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  scale_fill_npg()
+```
+
+### Ancestry Specific
+```{r}
+pgs_dir <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+file_directory <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_results"
+file_list <- list.files(file_directory, pattern = "*_summary_traitPRS_withPRSmixPlus.txt", full.names = TRUE)
+pheno_list <- c("inc_diabetes" ,"inc_dyslipid" ,"inc_ischemic", "inc_anycmd" , "inc_hyperten" )
+#pheno_list <- c("inc_diabetes" ,"inc_dyslipid" ,"inc_ischemic" , "inc_hyperten" )
+
+
+ANCESTRIES <- c("ALL",  "EUR", "AFR", "EAS", "AMR")
+
+auc_pgs <- data.table()
+auc_null <- data.table()
+for(ancestry in ANCESTRIES){
+  if(ancestry =="ALL"){
+        for (pheno in pheno_list){
+        #AUC
+        a_auc_pgs <- fread(pgs_dir %&% "prsmix_results/" %&% ancestry %&% "_" %&% pheno %&% "_auc_BestPGS.txt", header = T)
+        a_auc_pgs$pheno <- pheno
+        a_auc_pgs$anc <- ancestry
+        a_auc_null <- fread(pgs_dir %&% "prsmix_results/" %&% ancestry %&% "_" %&% pheno %&% "_auc_NULL.txt", header = T)
+        a_auc_null$anc <- ancestry
+        a_auc_null$pheno <- pheno
+        
+        auc_pgs <- bind_rows(auc_pgs, a_auc_pgs)
+        auc_null <- bind_rows(auc_null, a_auc_null)
+      }
+    }else{
+    for (pheno in pheno_list){
+      #AUC
+      a_auc_pgs <- fread(pgs_dir %&% "prsmix_results/" %&% ancestry %&% "_" %&% pheno %&% "_auc_BestPGS.txt", header = T)
+      a_auc_pgs$pheno <- pheno
+      a_auc_pgs$anc <- ancestry
+      a_auc_null <- fread(pgs_dir %&% "prsmix_results/" %&% ancestry %&% "_" %&%  pheno %&% "_auc_NULL.txt", header = T)
+      a_auc_null$anc <- ancestry
+      a_auc_null$pheno <- pheno
+      
+      auc_pgs <- bind_rows(auc_pgs, a_auc_pgs)
+      auc_null <- bind_rows(auc_null, a_auc_null)
+    
+    # ACCURACY
+    }
+  }
+}
+
+
+auc_comp <- bind_rows(auc_pgs, auc_null)
+auc_comp$anc<-factor(auc_comp$anc, levels = c("ALL", "AFR", "AMR", "EAS", "EUR"))
+```
+
+
+```{r, fig.height= 12}
+ggplot(auc_comp, aes(x = auc, y = pheno, fill = anc)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", alpha =0.75) +  # Horizontal bars with borders
+  geom_errorbar(aes(xmin = lowerCI, xmax = upperCI), 
+                width = 0.3,  # Width of the error bar ends
+                position = position_dodge(width = 0.9)) +  # Dodge to align with bars
+  geom_text(aes(label = round(auc, 3), x = 0.05),  # Add labels slightly to the right
+        position = position_dodge(width = 0.9),    # Align with bars
+        size = 4,                                  # Adjust text size
+        hjust = 1) +
+  labs(
+    x = "AUC",
+    y = "Phenotype",
+    title = "AUC for Phenotypes by Method"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  scale_fill_npg() + facet_wrap(~method, nrow=2)
+```
+
+# Pull difference in performance
+```{r}
+
+setDT(auc_comp)
+
+# Check if there are both `bestPGS` and `null_model` methods for each group
+if (all(c("bestPGS", "null_model") %in% unique(auc_comp$method))) {
+  # Calculate the difference in AUC between bestPGS and null_model
+  auc_differences <- auc_comp[
+    , .(auc_diff = auc[method == "bestPGS"] - auc[method == "null_model"]),
+    by = .(pheno, anc)
+  ]
+  
+  # Print the results
+  print(auc_differences)
+} else {
+  print("Both 'bestPGS' and 'null_model' must be present in the data for each group.")
+}
+
+
+ggplot(auc_differences, aes(x = auc_diff, y = pheno, fill = anc)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black", alpha =0.75) +  # Horizontal bars with borders
+  labs(
+    x = "Difference in AUC between PGS and covariate-only model",
+    y = "Phenotype",
+    title = "AUC Difference for Phenotypes"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  scale_fill_npg()
+```
+
+
+```{r}
+file_directory <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_results"
+file_list <- list.files(file_directory, pattern = "*_summary_traitPRS_withPRSmix.txt", full.names = TRUE)
+
+prsmixplus_summary <- data.table()
+for (file in file_list){
+  phenotype <- sub(".*/(.*?)_power.0.95_pthres.0.00714285714285714_test_summary_traitPRS_withPRSmix.txt", "\\1", file)
+  start <- fread(file)
+  print("Processing: " %&% file)
+  start$phenotype <- phenotype
+  prsmixplus_summary <- bind_rows(prsmixplus_summary, start)
+}
+
+```
+
+```{r, fig.width = 6, fig.height = 10}
+ggplot(prsmixplus_summary, aes(x = R2, y = pgs, fill = phenotype)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +  # Horizontal bars with borders
+  geom_errorbar(aes(xmin = lowerCI, xmax = upperCI), 
+                width = 0.3,  # Width of the error bar ends
+                position = position_dodge(width = 0.9)) +  # Dodge to align with bars
+  labs(
+    x = "Accuracy (R2)",
+    y = "PGS",
+    title = "R2 for Phenotypes by Method"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  geom_text(aes(label = round(R2, 3), x = R2 + 0.02),  # Add labels slightly to the right
+          position = position_dodge(width = 0.9),    # Align with bars
+          size = 4,                                  # Adjust text size
+          hjust = 1, vjust=1.3) +
+  scale_fill_npg() + facet_wrap(~phenotype, scales = "free_y", nrow = 5) +guides(fill="none")
+```
+
+1) Cox Model
+2) Follow Up to determine best PGS
+3) Differences in Performance by Ancestry
+4) Comparison to covariates alone.
+5) Stratify by recipient of disease.
+
+
+# Stratification 
+
+
+## Combined
+
+```{r split_string}
+library(stringr)
+split_string_parts <- function(x) {
+  parts <- str_split(x, "_", simplify = T)
+  n <- ncol(parts)
+  before_second<- str_c(parts[1:2], collapse = "_")
+  between<- str_c(parts[3:(n-1)], collapse = "_")
+  after_last<- parts[n]
+  return(list(before_second = before_second,
+              between= between,
+              after_last = after_last))
+}
+```
+
+```{r}
+pgs_dir<-"/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+
+treatment<- c("rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+pheno_list <- c()
+file_directory <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_results/treatment_strat/"
+file_list <- list.files(file_directory, pattern = "*auc_BestPGS.txt", full.names = TRUE)
+for (file in file_list) {
+  phenotype <- sub(".*/ALL_(.*?)_auc_BestPGS.txt", "\\1", file)
+  pheno_list <- c(pheno_list, phenotype)
+}
+
+# Auc Values
+auc_pgs <- data.table()
+auc_null <- data.table()
+or_pgs <-data.table()
+or_null <- data.table()
+
+pgs_acc <- data.table()
+for (pheno in pheno_list){
+  # ACCURACY
+  best_pgs_acc <- fread(file_directory %&% "ALL_" %&% pheno %&% "_best_acc.txt", header = T)
+  top_pgs <- best_pgs_acc$pgs
+  best_pgs_acc$pheno <- pheno
+
+  pgs_acc <- bind_rows(pgs_acc, best_pgs_acc)
+  #AUC
+  a_auc_pgs <- fread(pgs_dir %&% "prsmix_results/treatment_strat/ALL_" %&% pheno %&% "_auc_BestPGS.txt", header = T)
+  a_auc_pgs$pheno <- pheno
+  a_auc_pgs$pgs <- top_pgs
+  a_auc_null <- fread(pgs_dir %&% "prsmix_results/treatment_strat/ALL_" %&% pheno %&% "_auc_NULL.txt", header = T)
+  a_auc_null$pheno <- pheno
+  
+  auc_pgs <- bind_rows(auc_pgs, a_auc_pgs)
+  auc_null <- bind_rows(auc_null, a_auc_null)
+  
+  #OR
+  a_or_pgs <- fread(file_directory %&% "ALL_" %&% pheno %&% "_OR_BestPGS.txt", header = T) %>%
+    mutate(mm = as.numeric(mm))
+  a_or_pgs$pheno <- pheno
+  a_or_pgs$pgs <- top_pgs
+  
+  or_pgs <- bind_rows(or_pgs, a_or_pgs)
+
+
+}
+auc_comp <- bind_rows(auc_pgs, auc_null)
+auc_comp_sep <- auc_comp %>%
+  rowwise() %>%
+  mutate(split= list(split_string_parts(pheno))) %>%
+  unnest_wider(split, names_sep = "_") %>%
+  rename(outcome = split_before_second,
+         treatment = split_between,
+         received_tx = split_after_last) %>%
+  ungroup()
+
+or_comb<- or_pgs %>%
+  rowwise() %>%
+  mutate(split= list(split_string_parts(pheno))) %>%
+  unnest_wider(split, names_sep = "_") %>%
+  rename(outcome = split_before_second,
+         treatment = split_between,
+         received_tx = split_after_last) %>%
+  ungroup()
+
+acc_comb <- pgs_acc %>%
+  rowwise() %>%
+  mutate(split= list(split_string_parts(pheno))) %>%
+  unnest_wider(split, names_sep = "_") %>%
+  rename(outcome = split_before_second,
+         treatment = split_between,
+         received_tx = split_after_last) %>%
+  ungroup()
+
+
+
+
+
+
+
+
+  
+```
+
+```{r, fig.height = 20}
+ggplot(auc_comp_sep, aes(x = auc, y = outcome, fill = interaction(method, received_tx))) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +  # Horizontal bars with borders
+  geom_errorbar(aes(xmin = lowerCI, xmax = upperCI), 
+                width = 0.3,  # Width of the error bar ends
+                position = position_dodge(width = 0.9)) +  # Dodge to align with bars
+  geom_text(aes(label = round(auc, 3), x = auc - .1),  # Add labels slightly to the right
+        position = position_dodge(width = 0.9),    # Align with bars
+        size = 4,                                  # Adjust text size
+        hjust = 1) +
+  labs(
+    x = "AUC",
+    y = "Phenotype",
+    title = "AUC for Phenotypes by Method"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  scale_fill_npg() + facet_wrap(~treatment, ncol =1 )
+```
+
+# Statistical Comparison of AUCs
+
+```{r}
+calculate_z_p_value <- function(mean1, mean2, se1, se2) {
+  #' Calculates the Z-statistic and two-tailed p-value for the difference of two means.
+  #'
+  #' Args:
+  #'   mean1 (numeric): The mean of the first group.
+  #'   mean2 (numeric): The mean of the second group.
+  #'   se1 (numeric): The standard error of the mean of the first group.
+  #'   se2 (numeric): The standard error of the mean of the second group.
+  #'
+  #' Returns:
+  #'   A list containing:
+  #'     z_statistic (numeric): The calculated Z-statistic.
+  #'     p_value (numeric): The two-tailed p-value. Returns NA if standard errors are non-positive.
+  #'
+  if (se1 <= 0 || se2 <= 0) {
+    return(list(z_statistic = NA, p_value = NA))
+  } else {
+    z_statistic <- (mean1 - mean2) / sqrt(se1^2 + se2^2)
+    p_value <- 2 * pnorm(abs(z_statistic), lower.tail = FALSE)
+    return(list(z_statistic = z_statistic, p_value = p_value))
+  }
+}
+```
+
+```{r}
+auc_comp_sep <- auc_comp_sep %>%
+  mutate(se = (upperCI - lowerCI) / (2 *1.96)) %>%
+  filter(!is.na(se))
+
+final_results <- data.table()
+data <- auc_comp_sep
+for (tx in treatment){
+  print(tx)
+  for (phx in unique(data$outcome)){
+    print(phx)
+    df <- data %>%
+      filter(treatment == tx) %>% filter(outcome == phx) %>% mutate(group = paste0(method, "_", received_tx))
+    GROUPS = unique(df$group)
+    COMPARISONS_MATRIX <- combn(GROUPS, 2)
+    COMPARISONS <- lapply(1:ncol(COMPARISONS_MATRIX), function(i) COMPARISONS_MATRIX[,i])
+     # Initialize an empty list to store the results
+    for (comparison in COMPARISONS) {
+      group_name1 <- comparison[1]
+      group_name2 <- comparison[2]
+    
+      # Get the data for group 1
+      data_group1 <- df%>%
+        filter(group == group_name1)
+      # Get the data for group 2
+      data_group2 <- df %>%
+        filter(group == group_name2)
+      # Extract mean (auc) and standard error (se) for group 1
+      mean1 <- data_group1$auc[1] # Assuming only one row per group in df_input
+      se1 <- data_group1$se[1]
+      # Extract mean (auc) and standard error (se) for group 2
+      mean2 <- data_group2$auc[1] # Assuming only one row per group in df_input
+      se2 <- data_group2$se[1]
+      # Calculate Z-score and p-value using your function
+      z_p_result <- calculate_z_p_value(mean1, mean2, se1, se2)
+      # Store the results for this comparison
+      new_row<- data.frame(
+        group1 = group_name1,
+        group2 = group_name2,
+        difference_in_means = mean1 - mean2,
+        z_statistic = z_p_result$z_statistic,
+        p_value = z_p_result$p_value,
+        treatment = tx,
+        outcome = phx
+      )
+      final_results <- rbind(final_results, new_row)
+    }
+  }
+}
+```
+
+```{r}
+sig_results_auc <- final_results %>% filter(p_value < 0.05) %>% mutate(group=paste0(treatment, "_", outcome))
+
+auc_comp_sep_sig <- auc_comp_sep %>% mutate(group=paste0(treatment, "_", outcome)) %>% filter( group %in% sig_results_auc$group)
+ggplot(auc_comp_sep_sig, aes(x = auc, y = outcome, fill = interaction(method, received_tx))) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +  # Horizontal bars with borders
+  geom_errorbar(aes(xmin = lowerCI, xmax = upperCI), 
+                width = 0.3,  # Width of the error bar ends
+                position = position_dodge(width = 0.9)) +  # Dodge to align with bars
+  geom_text(aes(label = round(auc, 3), x = auc - .1),  # Add labels slightly to the right
+        position = position_dodge(width = 0.9),    # Align with bars
+        size = 4,                                  # Adjust text size
+        hjust = 1) +
+  labs(
+    x = "AUC",
+    y = "Phenotype",
+    title = "AUC for Phenotypes by Method"
+  ) +
+  theme_bw(14) +  # Clean theme
+  theme(
+    axis.text.y = element_text(size = 10),  # Adjust y-axis text size
+    axis.title = element_text(size = 12),  # Adjust axis title size
+    legend.position = "right"  # Place legend on the right
+  ) +
+  scale_fill_npg() + facet_wrap(~treatment, ncol =1, scales = "free_y")
+
+```
+
+
+# Pull Metrics for PGS
+
+```{r}
+
+cox_results <- readRDS("/bd-fs-mnt/TenantShare/exthome/home/l578311/cvd/pgs_revised/data/results_data/all_results_norounding.rds")
+
+```
+
+# Debugging AUC issue.
+
+It looks like I need to debug why I am not getting the correct output for some of the PRSMixPlus results...
+```{r}
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_diabetes_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_diabetes_covariates.txt"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_ischemic", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+pheno_name <- "inc_diabetes"
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_file_paths.txt", header =F)$V1 
+
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_PGS_list.txt", header = F)
+num_pgs <- nrow(pgs_list1)
+
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_PGS_list.txt"
+isbinary <- TRUE
+out <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_out"
+allPGS_list = NULL
+metascore = NULL 
+liabilityR2 = TRUE
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = F
+train_size_list = NULL
+training_result_file = NULL
+power_thres_list = c(0.95) 
+pval_thres_list = (.05/7)
+nfold_cv = 3
+read_pred_training = FALSE
+read_pred_testing = FALSE
+debug = F 
+
+```
+
+
+```{r}
+options(datatable.fread.datatable = FALSE)
+writeLines("--- Reading covariate data ---")
+basic_data = fread(covariate_file)
+basic_data = basic_data[, c(IID_pheno, covar_list)]
+if (length(cat_covar_list) > 0) {
+  writeLines("Generating dummy variables from categorical variables")
+  basic_data_list = make_dummy_columns(basic_data, cat_covar_list)
+  covar_list = covar_list[-match(cat_covar_list, covar_list)]
+  covar_list = c(covar_list, basic_data_list[[2]])
+  basic_data = basic_data_list[[1]]
+}
+writeLines("--- Reading all polygenic risk scores ---")
+writeLines("Please make sure the column names for the scores ends with _SUM")
+all_scores = NULL
+for (score_file_i in 1:length(score_files_list)) {
+  print(score_file_i)
+  score_file = score_files_list[score_file_i]
+  dd = fread(score_file)
+  idx = which(endsWith(colnames(dd), "_SUM") & colnames(dd) != 
+    "NAMED_ALLELE_DOSAGE_SUM")
+  idx2 = which(colnames(dd) == "IID")
+  dd_sub = dd[, c(idx2, idx)]
+  print(dim(dd_sub))
+  if (is.null(all_scores)) {
+    all_scores = dd_sub
+  }
+  else all_scores = merge(all_scores, dd_sub, by = "IID")
+}
+colnames(all_scores)[2:ncol(all_scores)] = substring(colnames(all_scores)[2:ncol(all_scores)], 
+  1, nchar(colnames(all_scores)[2:ncol(all_scores)]) - 
+    4)
+if (!is.null(allPGS_list)) {
+    pgs_extract = intersect(colnames(all_scores[2:ncol(all_scores)]), 
+      allPGS_list)
+    all_scores = all_scores[, c(1, match(pgs_extract, colnames(all_scores)))]
+}
+score_names = colnames(all_scores)[2:ncol(all_scores)]
+pgs_list = NULL
+for (ff_i in 1:length(trait_specific_score_file)) {
+  writeLines(paste0("Reading: ", trait_specific_score_file[ff_i]))
+  pgs_list_tmp = fread(trait_specific_score_file[ff_i], 
+    header = F)[, 1]
+  pgs_list = c(pgs_list, pgs_list_tmp)
+}
+pgs_list = intersect(pgs_list, colnames(all_scores))
+pheno = fread(pheno_file)
+idx = which(colnames(pheno) %in% c(IID_pheno, pheno_name))
+pheno = pheno[, idx]
+colnames(pheno) = c("IID", "trait")
+```
+
+#### Merging Phenotype and PRS Files
+
+```{r}
+writeLines("--- Merging Phenotype and PRS files ---")
+pheno_prs = merge(pheno, all_scores, by = "IID")
+pheno_prs_cov = merge(pheno_prs, basic_data, by.x = "IID", 
+  by.y = IID_pheno)
+pheno_prs_cov = pheno_prs_cov[which(!is.na(pheno_prs_cov$trait)), 
+  ]
+irnt = function(x) return(qnorm((rank(x, na.last = "keep") - 
+  0.5)/sum(!is.na(x))))
+rr = function(x, d = 3) round(x, d)
+null_train_size_list = F
+if (is.null(train_size_list)) {
+  writeLines("--- Selecting 80% as training data ---")
+  train_size_list = floor(0.8 * nrow(pheno_prs_cov))
+  null_train_size_list = T
+} else {
+  writeLines("Using custom data split!")
+}
+out_save = out
+```
+
+```{r}
+
+train_size = train_size_list[1]
+writeLines(paste("--- Using ", train_size, " individuals for training sample ---"))
+if (!null_train_size_list) 
+  out = paste0(out_save, "_train.", train_size)
+if (isbinary) 
+  fwrite(as.data.frame(table(pheno_prs_cov$trait)), 
+    paste0(out, "_case_counts.txt"), row.names = F, 
+    sep = "\t", quote = F)
+set.seed(1)
+train_idx = sample(1:nrow(pheno_prs_cov), train_size)
+train_df = pheno_prs_cov[train_idx, ]
+test_df = pheno_prs_cov[-train_idx, ]
+if (!isbinary) {
+  train_df$trait = irnt(train_df$trait)
+  test_df$trait = irnt(test_df$trait)
+}
+
+cc = apply(train_df[, covar_list], 2, function(x) length(unique(x)))
+covar_list1 = covar_list[-which(cc <= 5)]
+for (i in covar_list1) train_df[i] = as.numeric(scale(train_df[i]))
+for (i in covar_list1) test_df[i] = as.numeric(scale(test_df[i]))
+fwrite(train_df[, c(1, 2)], paste0(out, "_train_df.txt"), 
+  row.names = F, quote = F, sep = "\t")
+fwrite(test_df[, c(1, 2)], paste0(out, "_test_df.txt"), 
+  row.names = F, quote = F, sep = "\t")
+writeLines("--- Evaluating PRS in training set ---")
+if (!read_pred_training | is.null(training_result_file)) {
+  training_file = paste0(out, "_train_allPRS.txt")
+  read_pred_training_1 = (read_pred_training & file.exists(training_file))
+}else {
+  training_file = training_result_file
+  read_pred_training_1 = read_pred_training & all(file.exists(training_file))
+  if (!read_pred_training_1) {
+    writeLines("Declared:")
+    writeLines(paste0("read_pred_training = ", read_pred_training))
+    writeLines(paste0("training_result_file = ", 
+      paste(training_result_file, collapse = ";")))
+    stop("Reading existing training result but there is at least one missing training result file. Please check parameter all files available in <training_result_file> or set read_pred_testing=F and training_result_file=NULL")
+  }
+  writeLines(paste0("Reading all files in training_result_file"))
+}
+if (!read_pred_training_1) {
+  sumscore = apply(as.data.frame(train_df[, score_names]), 
+    2, var)
+  idx = which(sumscore == 0)
+  if (length(idx) > 0) 
+    train_df = train_df[, -match(names(idx), colnames(train_df))]
+  pgs_list_all = colnames(train_df)
+  pgs_list_all = pgs_list_all[which(pgs_list_all %in% 
+    colnames(all_scores)[2:ncol(all_scores)])]
+  pred_acc_train_allPGS_summary = eval_multiple_PRS(train_df, 
+    pgs_list_all, covar_list, liabilityR2, alpha = 0.05, 
+    isbinary = isbinary)
+  head(pred_acc_train_allPGS_summary)
+  fwrite(pred_acc_train_allPGS_summary, training_file, 
+    row.names = F, sep = "\t", quote = F)
+}else {
+  pred_acc_train_allPGS_summary = NULL
+  for (file_i in 1:length(training_file)) {
+    writeLines(paste0("Reading training file: ", 
+      training_file[file_i]))
+    pred_acc_train_allPGS_summary_tmp = fread(training_file[file_i])
+    pred_acc_train_allPGS_summary = rbind(pred_acc_train_allPGS_summary, 
+      pred_acc_train_allPGS_summary_tmp)
+  }
+  pred_acc_train_allPGS_summary = pred_acc_train_allPGS_summary[!duplicated(pred_acc_train_allPGS_summary$pgs), 
+    ]
+}
+```
+
+```{r}
+pred_acc_train_allPGS_summary = as.data.frame(pred_acc_train_allPGS_summary)
+pred_acc_train_trait_summary = pred_acc_train_allPGS_summary
+pred_acc_train_trait_summary = pred_acc_train_trait_summary[order(as.numeric(pred_acc_train_trait_summary$pval), 
+  decreasing = F), ]
+head(pred_acc_train_trait_summary)
+pred_acc_train_allPGS_summary1 = pred_acc_train_allPGS_summary %>% 
+  filter(pgs %in% pgs_list)
+pred_acc_train_allPGS_summary1 = pred_acc_train_allPGS_summary1[order(as.numeric(pred_acc_train_allPGS_summary1$R2), 
+  decreasing = T), ]
+bestPRS = pred_acc_train_allPGS_summary1[1, 1]
+writeLines(paste0("The best single trait-specific score in the training set is ", 
+  bestPRS))
+bestPRS_acc = eval_single_PRS(test_df, pheno = "trait", 
+  prs_name = bestPRS, covar_list = covar_list, liabilityR2, 
+  alpha = 0.05, isbinary = isbinary)
+fwrite(bestPRS_acc, paste0(out, "_best_acc.txt"), row.names = F, 
+  sep = "\t", quote = F)
+writeLines("--- Evaluating PRS in testing set ---")
+testing_file = paste0(out, "_test_allPRS.txt")
+read_pred_testing_1 = (read_pred_testing & file.exists(testing_file))
+if (!read_pred_testing_1) {
+  sumscore = apply(test_df[, score_names], 2, var)
+  idx = which(sumscore == 0)
+  if (length(idx) > 0) 
+    test_df = test_df[, -match(names(idx), colnames(test_df))]
+  pred_acc_test_trait = eval_multiple_PRS(test_df, 
+    pgs_list, covar_list, liabilityR2, alpha = 0.05, 
+    isbinary = isbinary)
+  pred_acc_test_trait_summary = pred_acc_test_trait
+  pred_acc_test_trait_summary = pred_acc_test_trait_summary[order(as.numeric(pred_acc_test_trait_summary$pval), 
+    decreasing = F), ]
+  print(head(pred_acc_test_trait_summary))
+  fwrite(pred_acc_test_trait_summary, testing_file, 
+    row.names = F, sep = "\t", quote = F)
+} else {
+      writeLines(paste0("Reading testing file: ", testing_file))
+      pred_acc_test_trait_summary = fread(testing_file)
+}
+```
+
+
+```{r}
+x_train = (train_df %>% select(all_of(c(bestPRS, 
+        covar_list)), -trait))
+y_train = as.vector(train_df$trait)
+train_data = data.frame(x_train, trait = y_train)
+x_test = (test_df %>% select(all_of(c(bestPRS, covar_list)), 
+  -trait))
+y_test = as.vector(test_df$trait)
+test_data = data.frame(x_test, trait = y_test)
+train_tmp = train_data[, c("trait", c(bestPRS, covar_list))]
+train_tmp$trait = as.factor(train_tmp$trait)
+formula_null = as.formula(paste0("trait ~ ", paste0(covar_list, 
+  collapse = "+")))
+formula_bestPRS = as.formula(paste0("trait ~ scale(", 
+  bestPRS, ")+", paste0(covar_list, collapse = "+")))
+ctrl = trainControl(method = "repeatedcv", allowParallel = TRUE, 
+  number = nfold_cv, returnData = FALSE, trim = T, 
+  verboseIter = T)
+cl = makePSOCKcluster(ncores)
+cl = makeCluster(ncores)
+registerDoParallel(cl)
+set.seed(123)
+model_prsmix_null = train(formula_null, data = train_tmp, 
+  method = "glmnet", trControl = ctrl, family = "binomial", 
+  tuneLength = 50, verbose = T)
+set.seed(123)
+model_prsmix_bestPRS = train(formula_bestPRS, data = train_tmp, 
+  method = "glmnet", trControl = ctrl, family = "binomial", 
+  tuneLength = 50, verbose = T)
+stopCluster(cl)
+```
+      
+```{r}
+test_data1 = test_data
+test_pred = predict(model_prsmix_null, test_data1, 
+  type = "prob")[, 2]
+auc_ci = ci.auc(test_data1$trait, test_pred)
+auc_out = data.frame(method = "null_model", auc = auc_ci[2], 
+  lowerCI = auc_ci[1], upperCI = auc_ci[3])
+fwrite(auc_out, paste0(out, "_auc_NULL.txt"), row.names = F, 
+  sep = "\t", quote = F)
+test_pred = predict(model_prsmix_bestPRS, test_data1, 
+  type = "prob")[, 2]
+auc_ci = ci.auc(test_data1$trait, test_pred)
+auc_out = data.frame(method = "bestPGS", auc = auc_ci[2], 
+  lowerCI = auc_ci[1], upperCI = auc_ci[3])
+fwrite(auc_out, paste0(out, "_auc_BestPGS.txt"), 
+  row.names = F, sep = "\t", quote = F)
+model1 = glm(formula_bestPRS, data = test_data1, 
+  family = "binomial")
+model1s = summary(model1)
+mm = exp(model1s$coefficients[2, 1])
+ll = exp(model1s$coefficients[2, 1] - 1.97 * model1s$coefficients[2, 
+  2])
+uu = exp(model1s$coefficients[2, 1] + 1.97 * model1s$coefficients[2, 
+  2])
+pval = format.pval(model1s$coefficients[2, 4])
+writeLines(paste0("OR = ", rr(mm), " (", rr(ll), 
+  "-", rr(uu), "); P-value=", pval))
+fwrite(data.frame(mm, ll, uu, pval), paste0(out, 
+  "_OR_BestPGS.txt"), row.names = F, sep = "\t", 
+  quote = F)
+```
+
+
+```{r}
+pred_acc_train_trait_summary = pred_acc_train_allPGS_summary %>% 
+      filter(pgs %in% pgs_list)
+pred_acc_test_trait_summary_out = pred_acc_test_trait_summary
+writeLines("--- Iterating power and p-value parameters --- ")
+```
+
+
+```{r}
+power_thres <- 0.95
+pval_thres <- .05
+
+writeLines(paste0("P = ", pval_thres))
+writeLines(paste0("Power = ", power_thres))
+writeLines("PRSmix:")
+topprs = pred_acc_train_trait_summary %>% filter(pval <= 
+  pval_thres & power >= power_thres)
+head(topprs)
+topprs = topprs$pgs
+topprs = intersect(topprs, colnames(train_df))
+print(length(topprs))
+start_time = Sys.time()
+```
+
+```{r}
+if (!isbinary) {
+  x_train = (train_df %>% select(all_of(c(topprs, 
+    covar_list)), -trait))
+  if (length(topprs) > 1) 
+    sd_train = apply(as.data.frame(x_train[, 
+      topprs]), 2, sd, na.rm = T)
+  x_train[, topprs] = scale(x_train[, topprs])
+  y_train = as.vector(train_df$trait)
+  train_data = data.frame(x_train, trait = y_train)
+  x_test = (test_df %>% select(all_of(c(topprs, 
+    covar_list)), -trait))
+  y_test = as.vector(test_df$trait)
+  test_data = data.frame(x_test, trait = y_test)
+  formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+    collapse = "+"), "+", paste0(covar_list, 
+    collapse = "+")))
+  train_tmp = train_data[, c("trait", topprs, 
+    covar_list)]
+  writeLines("Header of training data")
+  print(head(train_tmp))
+  if (length(topprs) == 1) {
+    ww = ww_raw = c(1)
+    names(ww) = names(ww_raw) = topprs
+  }
+  else {
+    ctrl = trainControl(method = "repeatedcv", 
+      allowParallel = TRUE, number = nfold_cv, 
+      verboseIter = T)
+    cl = makePSOCKcluster(ncores)
+    registerDoParallel(cl)
+    set.seed(123)
+    model_prsmix = train(formula, data = train_tmp, 
+      method = "glmnet", trControl = ctrl, tuneLength = 50, 
+      verbose = T)
+    stopCluster(cl)
+    model_prsmix$bestTune
+    ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+      1][-1]
+    ww = ww[which(!names(ww) %in% covar_list)]
+    ww_raw = ww
+    if (all(ww == 0)) {
+      writeLines("No weight for PRS")
+      ww = c(1)
+      names(ww) = bestPRS_acc$pgs
+      topprs = bestPRS_acc$pgs
+    }
+    else {
+      ww = ww/sd_train[match(names(ww), names(sd_train))]
+    }
+  }
+  test_df1 = cbind(test_data, IID = test_df$IID)
+  test_df1$newprs = as.matrix(test_df1[, topprs]) %*% 
+    as.vector(ww)
+  res_lm1 = eval_single_PRS(test_df1, pheno = "trait", 
+    prs_name = "newprs", covar_list = covar_list, 
+    liabilityR2 = liabilityR2, alpha = pval_thres, 
+    isbinary = isbinary)
+  res_lm1$pgs = "PRSmix"
+  res_lm1
+}else {
+  x_train = (train_df %>% select(all_of(c(topprs, 
+    covar_list)), -trait))
+  if (length(topprs) > 1) 
+    sd_train = apply(as.data.frame(x_train[, 
+      topprs]), 2, sd, na.rm = T)
+  x_train[, topprs] = scale(x_train[, topprs])
+  y_train = as.vector(train_df$trait)
+  train_data = data.frame(x_train, trait = y_train)
+  x_test = (test_df %>% select(all_of(c(topprs, 
+    covar_list)), -trait))
+  y_test = as.vector(test_df$trait)
+  test_data = data.frame(x_test, trait = y_test)
+  formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+    collapse = "+"), "+", paste0(covar_list, 
+    collapse = "+")))
+  train_tmp = train_data[, c("trait", topprs, 
+    covar_list)]
+  train_tmp$trait = as.factor(train_tmp$trait)
+  writeLines("Header of training data")
+  print(head(train_tmp))
+  if (length(topprs) == 1) {
+    ww = ww_raw = c(1)
+    names(ww) = names(ww_raw) = topprs
+  } else {
+    ctrl = trainControl(method = "repeatedcv", 
+      allowParallel = TRUE, number = nfold_cv, 
+      verboseIter = T)
+    cl = makePSOCKcluster(ncores)
+    registerDoParallel(cl)
+    set.seed(123)
+    model_prsmix = train(formula, data = train_tmp, 
+      method = "glmnet", trControl = ctrl, family = "binomial", 
+      tuneLength = 50, verbose = T)
+    stopCluster(cl)
+    model_prsmix$bestTune
+    ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+      1][-1]
+    ww_raw = ww
+    if (all(ww == 0)) {
+      writeLines("No weight for PRS")
+      ww = c(1)
+      names(ww) = bestPRS_acc$pgs
+      topprs = bestPRS_acc$pgs
+    }    else {
+      ww = ww[which(!names(ww) %in% covar_list)]
+      ww = ww/sd_train[match(names(ww), names(sd_train))]
+    }
+    if (debug) {
+      print(ww)
+    }
+    test_data1 = test_data
+    test_data1[, topprs] = as.numeric(scale(test_data[, 
+      topprs]))
+    test_pred = predict(model_prsmix, test_data1, 
+      type = "prob")[, 2]
+    auc_ci = ci.auc(test_data1$trait, test_pred)
+    auc_out = data.frame(method = "prsmix", 
+      auc = auc_ci[2], lowerCI = auc_ci[1], 
+      upperCI = auc_ci[3])
+    fwrite(auc_out, paste0(out, "_power.", power_thres, 
+      "_pthres.", pval_thres, "_auc_PRSmix.txt"), 
+      row.names = F, sep = "\t", quote = F)
+  }
+}
+```
+
+```{r full_script_debug}
+options(datatable.fread.datatable = FALSE)
+writeLines("--- Reading covariate data ---")
+basic_data = fread(covariate_file)
+basic_data = basic_data[, c(IID_pheno, covar_list)]
+if (length(cat_covar_list) > 0) {
+  writeLines("Generating dummy variables from categorical variables")
+  basic_data_list = make_dummy_columns(basic_data, cat_covar_list)
+  covar_list = covar_list[-match(cat_covar_list, covar_list)]
+  covar_list = c(covar_list, basic_data_list[[2]])
+  basic_data = basic_data_list[[1]]
+}
+writeLines("--- Reading all polygenic risk scores ---")
+writeLines("Please make sure the column names for the scores ends with _SUM")
+all_scores = NULL
+for (score_file_i in 1:length(score_files_list)) {
+  print(score_file_i)
+  score_file = score_files_list[score_file_i]
+  dd = fread(score_file)
+  idx = which(endsWith(colnames(dd), "_SUM") & colnames(dd) != 
+    "NAMED_ALLELE_DOSAGE_SUM")
+  idx2 = which(colnames(dd) == "IID")
+  dd_sub = dd[, c(idx2, idx)]
+  print(dim(dd_sub))
+  if (is.null(all_scores)) {
+    all_scores = dd_sub
+  }
+  else all_scores = merge(all_scores, dd_sub, by = "IID")
+}
+colnames(all_scores)[2:ncol(all_scores)] = substring(colnames(all_scores)[2:ncol(all_scores)], 
+  1, nchar(colnames(all_scores)[2:ncol(all_scores)]) - 
+    4)
+if (!is.null(allPGS_list)) {
+  pgs_extract = intersect(colnames(all_scores[2:ncol(all_scores)]), 
+    allPGS_list)
+  all_scores = all_scores[, c(1, match(pgs_extract, colnames(all_scores)))]
+}
+score_names = colnames(all_scores)[2:ncol(all_scores)]
+pgs_list = NULL
+for (ff_i in 1:length(trait_specific_score_file)) {
+  writeLines(paste0("Reading: ", trait_specific_score_file[ff_i]))
+  pgs_list_tmp = fread(trait_specific_score_file[ff_i], 
+    header = F)[, 1]
+  pgs_list = c(pgs_list, pgs_list_tmp)
+}
+pgs_list = intersect(pgs_list, colnames(all_scores))
+pheno = fread(pheno_file)
+idx = which(colnames(pheno) %in% c(IID_pheno, pheno_name))
+pheno = pheno[, idx]
+colnames(pheno) = c("IID", "trait")
+writeLines("--- Merging Phenotype and PRS files ---")
+pheno_prs = merge(pheno, all_scores, by = "IID")
+pheno_prs_cov = merge(pheno_prs, basic_data, by.x = "IID", 
+  by.y = IID_pheno)
+pheno_prs_cov = pheno_prs_cov[which(!is.na(pheno_prs_cov$trait)), 
+  ]
+irnt = function(x) return(qnorm((rank(x, na.last = "keep") - 
+  0.5)/sum(!is.na(x))))
+rr = function(x, d = 3) round(x, d)
+null_train_size_list = F
+if (is.null(train_size_list)) {
+  writeLines("--- Selecting 80% as training data ---")
+  train_size_list = floor(0.8 * nrow(pheno_prs_cov))
+  null_train_size_list = T
+}else {
+  writeLines("Using custom data split!")
+}
+out_save = out
+for (train_size in train_size_list) {
+  train_size = train_size_list[1]
+  writeLines(paste("--- Using ", train_size, " individuals for training sample ---"))
+  if (!null_train_size_list) 
+    out = paste0(out_save, "_train.", train_size)
+  if (isbinary) 
+    fwrite(as.data.frame(table(pheno_prs_cov$trait)), 
+      paste0(out, "_case_counts.txt"), row.names = F, 
+      sep = "\t", quote = F)
+  set.seed(1)
+  train_idx = sample(1:nrow(pheno_prs_cov), train_size)
+  train_df = pheno_prs_cov[train_idx, ]
+  test_df = pheno_prs_cov[-train_idx, ]
+  if (!isbinary) {
+    train_df$trait = irnt(train_df$trait)
+    test_df$trait = irnt(test_df$trait)
+  }
+  cc = apply(train_df[, covar_list], 2, function(x) length(unique(x)))
+  covar_list1 = covar_list[-which(cc <= 5)]
+  for (i in covar_list1) train_df[i] = as.numeric(scale(train_df[i]))
+  for (i in covar_list1) test_df[i] = as.numeric(scale(test_df[i]))
+  fwrite(train_df[, c(1, 2)], paste0(out, "_train_df.txt"), 
+    row.names = F, quote = F, sep = "\t")
+  fwrite(test_df[, c(1, 2)], paste0(out, "_test_df.txt"), 
+    row.names = F, quote = F, sep = "\t")
+  writeLines("--- Evaluating PRS in training set ---")
+  if (!read_pred_training | is.null(training_result_file)) {
+    training_file = paste0(out, "_train_allPRS.txt")
+    read_pred_training_1 = (read_pred_training & file.exists(training_file))
+  }
+  else {
+    training_file = training_result_file
+    read_pred_training_1 = read_pred_training & all(file.exists(training_file))
+    if (!read_pred_training_1) {
+      writeLines("Declared:")
+      writeLines(paste0("read_pred_training = ", read_pred_training))
+      writeLines(paste0("training_result_file = ", 
+        paste(training_result_file, collapse = ";")))
+      stop("Reading existing training result but there is at least one missing training result file. Please check parameter all files available in <training_result_file> or set read_pred_testing=F and training_result_file=NULL")
+    }
+    writeLines(paste0("Reading all files in training_result_file"))
+  }
+  if (!read_pred_training_1) {
+    sumscore = apply(as.data.frame(train_df[, score_names]), 
+      2, var)
+    idx = which(sumscore == 0)
+    if (length(idx) > 0) 
+      train_df = train_df[, -match(names(idx), colnames(train_df))]
+    pgs_list_all = colnames(train_df)
+    pgs_list_all = pgs_list_all[which(pgs_list_all %in% 
+      colnames(all_scores)[2:ncol(all_scores)])]
+    pred_acc_train_allPGS_summary = eval_multiple_PRS(train_df, 
+      pgs_list_all, covar_list, liabilityR2, alpha = 0.05, 
+      isbinary = isbinary)
+    head(pred_acc_train_allPGS_summary)
+    fwrite(pred_acc_train_allPGS_summary, training_file, 
+      row.names = F, sep = "\t", quote = F)
+  }
+  else {
+    pred_acc_train_allPGS_summary = NULL
+    for (file_i in 1:length(training_file)) {
+      writeLines(paste0("Reading training file: ", 
+        training_file[file_i]))
+      pred_acc_train_allPGS_summary_tmp = fread(training_file[file_i])
+      pred_acc_train_allPGS_summary = rbind(pred_acc_train_allPGS_summary, 
+        pred_acc_train_allPGS_summary_tmp)
+    }
+    pred_acc_train_allPGS_summary = pred_acc_train_allPGS_summary[!duplicated(pred_acc_train_allPGS_summary$pgs), 
+      ]
+  }
+  pred_acc_train_allPGS_summary = as.data.frame(pred_acc_train_allPGS_summary)
+  pred_acc_train_trait_summary = pred_acc_train_allPGS_summary
+  pred_acc_train_trait_summary = pred_acc_train_trait_summary[order(as.numeric(pred_acc_train_trait_summary$pval), 
+    decreasing = F), ]
+  head(pred_acc_train_trait_summary)
+  pred_acc_train_allPGS_summary1 = pred_acc_train_allPGS_summary %>% 
+    filter(pgs %in% pgs_list)
+  pred_acc_train_allPGS_summary1 = pred_acc_train_allPGS_summary1[order(as.numeric(pred_acc_train_allPGS_summary1$R2), 
+    decreasing = T), ]
+  bestPRS = pred_acc_train_allPGS_summary1[1, 1]
+  writeLines(paste0("The best single trait-specific score in the training set is ", 
+    bestPRS))
+  bestPRS_acc = eval_single_PRS(test_df, pheno = "trait", 
+    prs_name = bestPRS, covar_list = covar_list, liabilityR2, 
+    alpha = 0.05, isbinary = isbinary)
+  fwrite(bestPRS_acc, paste0(out, "_best_acc.txt"), row.names = F, 
+    sep = "\t", quote = F)
+  writeLines("--- Evaluating PRS in testing set ---")
+  testing_file = paste0(out, "_test_allPRS.txt")
+  read_pred_testing_1 = (read_pred_testing & file.exists(testing_file))
+  if (!read_pred_testing_1) {
+    sumscore = apply(test_df[, score_names], 2, var)
+    idx = which(sumscore == 0)
+    if (length(idx) > 0) 
+      test_df = test_df[, -match(names(idx), colnames(test_df))]
+    pred_acc_test_trait = eval_multiple_PRS(test_df, 
+      pgs_list, covar_list, liabilityR2, alpha = 0.05, 
+      isbinary = isbinary)
+    pred_acc_test_trait_summary = pred_acc_test_trait
+    pred_acc_test_trait_summary = pred_acc_test_trait_summary[order(as.numeric(pred_acc_test_trait_summary$pval), 
+      decreasing = F), ]
+    print(head(pred_acc_test_trait_summary))
+    fwrite(pred_acc_test_trait_summary, testing_file, 
+      row.names = F, sep = "\t", quote = F)
+  }
+  else {
+    writeLines(paste0("Reading testing file: ", testing_file))
+    pred_acc_test_trait_summary = fread(testing_file)
+  }
+  if (isbinary) {
+    x_train = (train_df %>% select(all_of(c(bestPRS, 
+      covar_list)), -trait))
+    y_train = as.vector(train_df$trait)
+    train_data = data.frame(x_train, trait = y_train)
+    x_test = (test_df %>% select(all_of(c(bestPRS, covar_list)), 
+      -trait))
+    y_test = as.vector(test_df$trait)
+    test_data = data.frame(x_test, trait = y_test)
+    train_tmp = train_data[, c("trait", c(bestPRS, covar_list))]
+    train_tmp$trait = as.factor(train_tmp$trait)
+    formula_null = as.formula(paste0("trait ~ ", paste0(covar_list, 
+      collapse = "+")))
+    formula_bestPRS = as.formula(paste0("trait ~ scale(", 
+      bestPRS, ")+", paste0(covar_list, collapse = "+")))
+    ctrl = trainControl(method = "repeatedcv", allowParallel = TRUE, 
+      number = nfold_cv, returnData = FALSE, trim = T, 
+      verboseIter = T)
+    cl = makePSOCKcluster(ncores)
+    cl = makeCluster(ncores)
+    registerDoParallel(cl)
+    set.seed(123)
+    model_prsmix_null = train(formula_null, data = train_tmp, 
+      method = "glmnet", trControl = ctrl, family = "binomial", 
+      tuneLength = 50, verbose = T)
+    set.seed(123)
+    model_prsmix_bestPRS = train(formula_bestPRS, data = train_tmp, 
+      method = "glmnet", trControl = ctrl, family = "binomial", 
+      tuneLength = 50, verbose = T)
+    stopCluster(cl)
+    test_data1 = test_data
+    test_pred = predict(model_prsmix_null, test_data1, 
+      type = "prob")[, 2]
+    auc_ci = ci.auc(test_data1$trait, test_pred)
+    auc_out = data.frame(method = "null_model", auc = auc_ci[2], 
+      lowerCI = auc_ci[1], upperCI = auc_ci[3])
+    fwrite(auc_out, paste0(out, "_auc_NULL.txt"), row.names = F, 
+      sep = "\t", quote = F)
+    test_pred = predict(model_prsmix_bestPRS, test_data1, 
+      type = "prob")[, 2]
+    auc_ci = ci.auc(test_data1$trait, test_pred)
+    auc_out = data.frame(method = "bestPGS", auc = auc_ci[2], 
+      lowerCI = auc_ci[1], upperCI = auc_ci[3])
+    fwrite(auc_out, paste0(out, "_auc_BestPGS.txt"), 
+      row.names = F, sep = "\t", quote = F)
+    model1 = glm(formula_bestPRS, data = test_data1, 
+      family = "binomial")
+    model1s = summary(model1)
+    mm = exp(model1s$coefficients[2, 1])
+    ll = exp(model1s$coefficients[2, 1] - 1.97 * model1s$coefficients[2, 
+      2])
+    uu = exp(model1s$coefficients[2, 1] + 1.97 * model1s$coefficients[2, 
+      2])
+    pval = format.pval(model1s$coefficients[2, 4])
+    writeLines(paste0("OR = ", rr(mm), " (", rr(ll), 
+      "-", rr(uu), "); P-value=", pval))
+    fwrite(data.frame(mm, ll, uu, pval), paste0(out, 
+      "_OR_BestPGS.txt"), row.names = F, sep = "\t", 
+      quote = F)
+  }
+  pred_acc_train_trait_summary = pred_acc_train_allPGS_summary %>% 
+    filter(pgs %in% pgs_list)
+  pred_acc_test_trait_summary_out = pred_acc_test_trait_summary
+  writeLines("--- Iterating power and p-value parameters --- ")
+  for (power_thres in power_thres_list) for (pval_thres in pval_thres_list) {
+    writeLines(paste0("P = ", pval_thres))
+    writeLines(paste0("Power = ", power_thres))
+    writeLines("PRSmix:")
+    topprs = pred_acc_train_trait_summary %>% filter(pval <= 
+      pval_thres & power >= power_thres)
+    head(topprs)
+    topprs = topprs$pgs
+    topprs = intersect(topprs, colnames(train_df))
+    print(length(topprs))
+    start_time = Sys.time()
+    if (length(topprs) == 0) {
+      print("No high power trait-specific PRS for PRSmix")
+      ww_raw = 1
+    }
+    else {
+      if (!isbinary) {
+        x_train = (train_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        if (length(topprs) > 1) 
+          sd_train = apply(as.data.frame(x_train[, 
+            topprs]), 2, sd, na.rm = T)
+        x_train[, topprs] = scale(x_train[, topprs])
+        y_train = as.vector(train_df$trait)
+        train_data = data.frame(x_train, trait = y_train)
+        x_test = (test_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        y_test = as.vector(test_df$trait)
+        test_data = data.frame(x_test, trait = y_test)
+        formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+          collapse = "+"), "+", paste0(covar_list, 
+          collapse = "+")))
+        train_tmp = train_data[, c("trait", topprs, 
+          covar_list)]
+        writeLines("Header of training data")
+        print(head(train_tmp))
+        if (length(topprs) == 1) {
+          ww = ww_raw = c(1)
+          names(ww) = names(ww_raw) = topprs
+        }
+        else {
+          ctrl = trainControl(method = "repeatedcv", 
+            allowParallel = TRUE, number = nfold_cv, 
+            verboseIter = T)
+          cl = makePSOCKcluster(ncores)
+          registerDoParallel(cl)
+          set.seed(123)
+          model_prsmix = train(formula, data = train_tmp, 
+            method = "glmnet", trControl = ctrl, tuneLength = 50, 
+            verbose = T)
+          stopCluster(cl)
+          model_prsmix$bestTune
+          ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+            1][-1]
+          ww = ww[which(!names(ww) %in% covar_list)]
+          ww_raw = ww
+          if (all(ww == 0)) {
+            writeLines("No weight for PRS")
+            ww = c(1)
+            names(ww) = bestPRS_acc$pgs
+            topprs = bestPRS_acc$pgs
+          }
+          else {
+            ww = ww/sd_train[match(names(ww), names(sd_train))]
+          }
+        }
+        test_df1 = cbind(test_data, IID = test_df$IID)
+        test_df1$newprs = as.matrix(test_df1[, topprs]) %*% 
+          as.vector(ww)
+        res_lm1 = eval_single_PRS(test_df1, pheno = "trait", 
+          prs_name = "newprs", covar_list = covar_list, 
+          liabilityR2 = liabilityR2, alpha = pval_thres, 
+          isbinary = isbinary)
+        res_lm1$pgs = "PRSmix"
+        res_lm1
+      }
+      else {
+        x_train = (train_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        if (length(topprs) > 1) 
+          sd_train = apply(as.data.frame(x_train[, 
+            topprs]), 2, sd, na.rm = T)
+        x_train[, topprs] = scale(x_train[, topprs])
+        y_train = as.vector(train_df$trait)
+        train_data = data.frame(x_train, trait = y_train)
+        x_test = (test_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        y_test = as.vector(test_df$trait)
+        test_data = data.frame(x_test, trait = y_test)
+        formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+          collapse = "+"), "+", paste0(covar_list, 
+          collapse = "+")))
+        train_tmp = train_data[, c("trait", topprs, 
+          covar_list)]
+        train_tmp$trait = as.factor(train_tmp$trait)
+        writeLines("Header of training data")
+        print(head(train_tmp))
+        if (length(topprs) == 1) {
+          ww = ww_raw = c(1)
+          names(ww) = names(ww_raw) = topprs
+        }
+        else {
+          ctrl = trainControl(method = "repeatedcv", 
+            allowParallel = TRUE, number = nfold_cv, 
+            verboseIter = T)
+          cl = makePSOCKcluster(ncores)
+          registerDoParallel(cl)
+          set.seed(123)
+          model_prsmix = train(formula, data = train_tmp, 
+            method = "glmnet", trControl = ctrl, family = "binomial", 
+            tuneLength = 50, verbose = T)
+          stopCluster(cl)
+          model_prsmix$bestTune
+          ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+            1][-1]
+          ww_raw = ww
+          if (all(ww == 0)) {
+            writeLines("No weight for PRS")
+            ww = c(1)
+            names(ww) = bestPRS_acc$pgs
+            topprs = bestPRS_acc$pgs
+          }
+          else {
+            ww = ww[which(!names(ww) %in% covar_list)]
+            ww = ww/sd_train[match(names(ww), names(sd_train))]
+          }
+          if (debug) {
+            print(ww)
+          }
+          test_data1 = test_data
+          test_data1[, topprs] = as.numeric(scale(test_data[, 
+            topprs]))
+          test_pred = predict(model_prsmix, test_data1, 
+            type = "prob")[, 2]
+          auc_ci = ci.auc(test_data1$trait, test_pred)
+          auc_out = data.frame(method = "prsmix", 
+            auc = auc_ci[2], lowerCI = auc_ci[1], 
+            upperCI = auc_ci[3])
+          fwrite(auc_out, paste0(out, "_power.", power_thres, 
+            "_pthres.", pval_thres, "_auc_PRSmix.txt"), 
+            row.names = F, sep = "\t", quote = F)
+        }
+        test_df1 = cbind(test_data, IID = test_df$IID)
+        test_df1$newprs = as.matrix(test_df1[, topprs]) %*% 
+          as.vector(ww)
+        res_lm1 = eval_single_PRS(test_df1, pheno = "trait", 
+          prs_name = "newprs", covar_list = covar_list, 
+          liabilityR2 = liabilityR2, alpha = pval_thres, 
+          isbinary = isbinary)
+        res_lm1$pgs = "PRSmix"
+        res_lm1
+        ff = paste0("trait ~ scale(newprs) + ", paste0(covar_list, 
+          collapse = "+"))
+        model1 = glm(ff, data = test_df1, family = "binomial")
+        model1s = summary(model1)
+        mm = exp(model1s$coefficients[2, 1])
+        ll = exp(model1s$coefficients[2, 1] - 1.97 * 
+          model1s$coefficients[2, 2])
+        uu = exp(model1s$coefficients[2, 1] + 1.97 * 
+          model1s$coefficients[2, 2])
+        pval = format.pval(model1s$coefficients[2, 
+          4])
+        print(paste0("OR = ", rr(mm), " (", rr(ll), 
+          "-", rr(uu), "); P-value=", pval))
+        fwrite(data.frame(mm, ll, uu, pval), paste0(out, 
+          "_power.", power_thres, "_pthres.", pval_thres, 
+          "_OR_PRSmix.txt"), row.names = F, sep = "\t", 
+          quote = F)
+      }
+      fwrite(data.frame(c(topprs), ww), paste0(out, 
+        "_power.", power_thres, "_pthres.", pval_thres, 
+        "_weight_PRSmix.txt"), sep = "\t", quote = F)
+      if (is_extract_adjSNPeff) {
+        mixing_weight_file = paste0(out, "_power.", 
+          power_thres, "_pthres.", pval_thres, "_weight_PRSmix.txt")
+        outfile = paste0(out, "_power.", power_thres, 
+          "_pthres.", pval_thres, "_adjSNPeff_PRSmix.txt")
+        extract_adjSNPeff(mixing_weight_file, original_beta_files_list, 
+          outfile)
+      }
+      print(res_lm1)
+      res_lm1_summary = res_lm1
+      res_lm1_summary$pgs = "PRSmix"
+      pred_acc_test_trait_summary_out = bind_rows(res_lm1, 
+        pred_acc_test_trait_summary)
+      head(pred_acc_test_trait_summary_out)
+      fwrite(pred_acc_test_trait_summary_out, paste0(out, 
+        "_power.", power_thres, "_pthres.", pval_thres, 
+        "_test_summary_traitPRS_withPRSmix.txt"), 
+        row.names = F, sep = "\t", quote = F)
+      prs_out = test_df1 %>% select(IID, newprs)
+      colnames(prs_out) = c("IID", "prsmix")
+      fwrite(prs_out, paste0(out, "_power.", power_thres, 
+        "_pthres.", pval_thres, "_prsmix.txt"), row.names = F, 
+        sep = "\t", quote = F)
+    }
+    end_time = Sys.time()
+    timerunning = difftime(end_time, start_time, units = "secs")[[1]]
+    timedf = data.frame(pgs = "PRSmix", npgs = length(ww_raw), 
+      time = timerunning)
+    print(timedf)
+    fwrite(timedf, paste0(out, "_power.", power_thres, 
+      "_pthres.", pval_thres, "_time_PRSmix.txt"), 
+      row.names = F, sep = "\t", quote = F)
+    writeLines("PRSmix+:")
+    topprs = pred_acc_train_allPGS_summary %>% filter(pval <= 
+      pval_thres & power >= power_thres)
+    topprs = topprs$pgs
+    topprs = intersect(topprs, colnames(train_df))
+    print(length(topprs))
+    start_time = Sys.time()
+    if (length(topprs) == 0) {
+      print("No high power trait-specific PRS for PRSmix+")
+      ww_raw = 1
+    }
+    else {
+      if (!isbinary) {
+        x_train = (train_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        if (length(topprs) > 1) 
+          sd_train = apply(as.data.frame(x_train[, 
+            topprs]), 2, sd, na.rm = T)
+        x_train[, topprs] = scale(x_train[, topprs])
+        y_train = as.vector(train_df$trait)
+        train_data = data.frame(x_train, trait = y_train)
+        x_test = (test_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        y_test = as.vector(test_df$trait)
+        test_data = data.frame(x_test, trait = y_test)
+        formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+          collapse = "+"), "+", paste0(covar_list, 
+          collapse = "+")))
+        train_tmp = train_data[, c("trait", topprs, 
+          covar_list)]
+        writeLines("Header of training data")
+        print(head(train_tmp))
+        if (length(topprs) == 1) {
+          ww = c(1)
+          names(ww) = topprs
+        }
+        else {
+          ctrl = trainControl(method = "repeatedcv", 
+            allowParallel = TRUE, number = nfold_cv, 
+            verboseIter = T)
+          cl = makePSOCKcluster(ncores)
+          registerDoParallel(cl)
+          set.seed(123)
+          model_prsmix = train(formula, data = train_tmp, 
+            method = "glmnet", trControl = ctrl, tuneLength = 50, 
+            verbose = T)
+          stopCluster(cl)
+          model_prsmix$bestTune
+          ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+            1][-1]
+          ww = ww[which(!names(ww) %in% covar_list)]
+          ww_raw = ww
+          if (all(ww == 0)) {
+            writeLines("No weight for PRS")
+            ww = c(1)
+            names(ww) = bestPRS_acc$pgs
+            topprs = bestPRS_acc$pgs
+          }
+          else {
+            ww = ww/sd_train[match(names(ww), names(sd_train))]
+          }
+        }
+        test_df1 = cbind(test_data, IID = test_df$IID)
+        test_df1$newprs = as.matrix(test_df1[, topprs]) %*% 
+          as.vector(ww)
+        res_lm = eval_single_PRS(test_df1, pheno = "trait", 
+          prs_name = "newprs", covar_list = covar_list, 
+          liabilityR2 = liabilityR2, alpha = pval_thres, 
+          isbinary = isbinary)
+        res_lm$pgs = "PRSmix+"
+        res_lm
+        nonzero_w = names(ww[which(ww != 0)])
+      }
+      else {
+        x_train = (train_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        if (length(topprs) > 1) 
+          sd_train = apply(as.data.frame(x_train[, 
+            topprs]), 2, sd, na.rm = T)
+        x_train[, topprs] = scale(x_train[, topprs])
+        y_train = as.vector(train_df$trait)
+        train_data = data.frame(x_train, trait = y_train)
+        x_test = (test_df %>% select(all_of(c(topprs, 
+          covar_list)), -trait))
+        y_test = as.vector(test_df$trait)
+        test_data = data.frame(x_test, trait = y_test)
+        formula = as.formula(paste0("trait ~ ", paste0(topprs, 
+          collapse = "+"), "+", paste0(covar_list, 
+          collapse = "+")))
+        train_tmp = train_data[, c("trait", topprs, 
+          covar_list)]
+        train_tmp$trait = as.factor(train_tmp$trait)
+        writeLines("Header of training data")
+        print(head(train_tmp))
+        if (length(topprs) == 1) {
+          ww = c(1)
+          names(ww) = topprs
+        }
+        else {
+          ctrl = trainControl(method = "repeatedcv", 
+            allowParallel = TRUE, number = nfold_cv, 
+            verboseIter = T)
+          cl = makePSOCKcluster(ncores)
+          registerDoParallel(cl)
+          set.seed(123)
+          model_prsmix = train(formula, data = train_tmp, 
+            method = "glmnet", trControl = ctrl, family = "binomial", 
+            tuneLength = 50, verbose = T)
+          stopCluster(cl)
+          model_prsmix$bestTune
+          ww = coef(model_prsmix$finalModel, model_prsmix$bestTune$lambda)[, 
+            1][-1]
+          ww = ww[which(!names(ww) %in% covar_list)]
+          ww_raw = ww
+          if (all(ww == 0)) {
+            writeLines("No weight for PRS")
+            ww = c(1)
+            names(ww) = bestPRS_acc$pgs
+            topprs = bestPRS_acc$pgs
+          }
+          else {
+            ww = ww/sd_train[match(names(ww), names(sd_train))]
+          }
+          test_data1 = test_data
+          test_data1[, topprs] = scale(test_data[, 
+            topprs])
+          test_pred = predict(model_prsmix, test_data1, 
+            type = "prob")[, 2]
+          auc_ci = ci.auc(test_data1$trait, test_pred)
+          auc_out = data.frame(method = "prsmixP", 
+            auc = auc_ci[2], lowerCI = auc_ci[1], 
+            upperCI = auc_ci[3])
+          fwrite(auc_out, paste0(out, "_power.", power_thres, 
+            "_pthres.", pval_thres, "_auc_PRSmixPlus.txt"), 
+            row.names = F, sep = "\t", quote = F)
+        }
+        test_df1 = cbind(test_data, IID = test_df$IID)
+        test_df1$newprs = as.matrix(test_df1[, topprs]) %*% 
+          as.vector(ww)
+        res_lm = eval_single_PRS(test_df1, pheno = "trait", 
+          "newprs", covar_list, liabilityR2 = liabilityR2, 
+          alpha = pval_thres, isbinary = isbinary)
+        res_lm$pgs = "PRSmix+"
+        res_lm
+        nonzero_w = names(ww[which(ww != 0)])
+        ff = paste0("trait ~ scale(newprs) + ", paste0(covar_list, 
+          collapse = "+"))
+        model = glm(ff, data = test_df1, family = "binomial")
+        model1s = summary(model)
+        mm = exp(model1s$coefficients[2, 1])
+        ll = exp(model1s$coefficients[2, 1] - 1.97 * 
+          model1s$coefficients[2, 2])
+        uu = exp(model1s$coefficients[2, 1] + 1.97 * 
+          model1s$coefficients[2, 2])
+        pval = format.pval(model1s$coefficients[2, 
+          4])
+        print(paste0("OR = ", rr(mm), " (", rr(ll), 
+          "-", rr(uu), "); P-value=", pval))
+        fwrite(data.frame(mm, ll, uu, pval), paste0(out, 
+          "_power.", power_thres, "_pthres.", pval_thres, 
+          "_OR_PRSmixPlus.txt"), row.names = F, sep = "\t", 
+          quote = F)
+      }
+      print(res_lm)
+      pred_acc_test_trait_summary_out = bind_rows(res_lm, 
+        pred_acc_test_trait_summary_out)
+      head(pred_acc_test_trait_summary_out)
+      fwrite(pred_acc_test_trait_summary_out, paste0(out, 
+        "_power.", power_thres, "_pthres.", pval_thres, 
+        "_test_summary_traitPRS_withPRSmixPlus.txt"), 
+        row.names = F, sep = "\t", quote = F)
+      prsmixplus = test_df1 %>% select(IID, newprs)
+      fwrite(prsmixplus, paste0(out, "_power.", power_thres, 
+        "_pthres.", pval_thres, "_prsmixPlus.txt"), 
+        row.names = F, sep = "\t", quote = F)
+      fwrite(data.frame(topprs, ww), paste0(out, "_power.", 
+        power_thres, "_pthres.", pval_thres, "_weight_PRSmixPlus.txt"), 
+        row.names = F, sep = "\t", quote = F)
+      if (is_extract_adjSNPeff) {
+        mixing_weight_file = paste0(out, "_power.", 
+          power_thres, "_pthres.", pval_thres, "_weight_PRSmixPlus.txt")
+        outfile = paste0(out, "_power.", power_thres, 
+          "_pthres.", pval_thres, "_adjSNPeff_PRSmixPlus.txt")
+        extract_adjSNPeff(mixing_weight_file, original_beta_files_list, 
+          outfile)
+      }
+      fwrite(data.frame(topprs, ww_raw), paste0(out, 
+        "_power.", power_thres, "_pthres.", pval_thres, 
+        "_weight_raw_PRSmixPlus.txt"), row.names = F, 
+        sep = "\t", quote = F)
+    }
+    end_time = Sys.time()
+    timerunning = difftime(end_time, start_time, units = "secs")[[1]]
+    timedf = data.frame(pgs = "PRSmix+", npgs = length(ww_raw), 
+      time = timerunning)
+    print(timedf)
+    fwrite(timedf, paste0(out, "_power.", power_thres, 
+      "_pthres.", pval_thres, "_time_PRSmixPlus.txt"), 
+      row.names = F, sep = "\t", quote = F)
+  }
+}
+writeLines("Finished")
+return(0)
+```
+
+
+```{r}
+
+dyslip_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_ischemic_PGS_list.txt"
+combine_PRS(
+    pheno_file = pheno_file ,
+    covariate_file = covariate_file ,
+    score_files_list = scores_file_vector ,
+    trait_specific_score_file = dyslip_pgs_list ,
+    pheno_name = pheno_name ,
+    isbinary = TRUE , 
+    out = "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/inc_ischemic_func_test_out", 
+    liabilityR2 = TRUE  ,
+    covar_list = covariates,
+    cat_covar_list = categorical_vars,
+    is_extract_adjSNPeff = FALSE,
+    train_size_list = NULL,
+    #power_thres_list = 0.95,
+    pval_thres_list = (0.05/7),
+    read_pred_training = FALSE,
+    read_pred_testing = FALSE,
+    original_beta_files_list = original_beta_files_list
+  )
+```

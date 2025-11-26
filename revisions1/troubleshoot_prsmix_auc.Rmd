@@ -1,0 +1,301 @@
+---
+title: "Resolving PRSMix+ AUC"
+author: "Peter fiorica"
+date: "2025-05-30"
+output: html_document
+---
+
+```{r packages}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(ggsci)
+library(PRSmix)
+
+"%&%"=function(a,b) paste(a,b,sep="")
+
+dir <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+
+original_beta_files_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/janise_share/weights.txt"
+isbinary <- TRUE
+allPGS_list = NULL
+metascore = NULL 
+liabilityR2 = TRUE
+train_size_list = NULL
+training_result_file = NULL
+read_pred_training = FALSE
+read_pred_testing = FALSE
+debug = F 
+```
+
+
+# Ischemic Heart Disease
+
+```{r}
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_ischemic_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_ischemic_covariates.txt"
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_ischemic_file_paths.txt", header =F)$V1 
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_ischemic_PGS_list.txt", header = F)
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_ischemic_PGS_list.txt"
+
+
+custom_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_ischemic_PGS_list.txt"
+out_path <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_EUR_inc_ischemic_"
+num_pgs <- nrow(pgs_list1)
+pheno_name <- "inc_ischemic"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_ischemic", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+```
+
+```{r}
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+out <- out_path
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = TRUE
+power_thres_list = c(0.95) 
+pval_thres_list = (.05/7)
+nfold_cv = 3
+```
+
+
+
+
+
+
+# Hypertension
+
+```{r}
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_hyperten_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_hyperten_covariates.txt"
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_hyperten_file_paths.txt", header =F)$V1 
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_hyperten_PGS_list.txt", header = F)
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_hyperten_PGS_list.txt"
+
+
+custom_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_hyperten_PGS_list.txt"
+out_path <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_EUR_inc_hyperten_"
+num_pgs <- nrow(pgs_list1)
+pheno_name <- "inc_hyperten"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_hyperten", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+```
+
+```{r}
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+out <- out_path
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = F
+power_thres_list = c(0.95) 
+pval_thres_list = (.05/7)
+nfold_cv = 3
+```
+
+
+# Dyslipidemia
+
+```{r}
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_dyslipid_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_dyslipid_covariates.txt"
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_dyslipid_file_paths.txt", header =F)$V1 
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_dyslipid_PGS_list.txt", header = F)
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_dyslipid_PGS_list.txt"
+
+
+custom_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_dyslipid_PGS_list.txt"
+out_path <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_EUR_inc_dyslipid_"
+num_pgs <- nrow(pgs_list1)
+pheno_name <- "inc_dyslipid"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_ischemic", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+```
+
+```{r}
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+out <- out_path
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = F
+power_thres_list = c(0.95) 
+pval_thres_list = (.05/7)
+nfold_cv = 3
+```
+
+# Diabetes
+
+```{r}
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_diabetes_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_diabetes_covariates.txt"
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_file_paths.txt", header =F)$V1 
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_PGS_list.txt", header = F)
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_PGS_list.txt"
+
+
+custom_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_diabetes_PGS_list.txt"
+out_path <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_EUR_inc_diabetes_"
+num_pgs <- nrow(pgs_list1)
+pheno_name <- "inc_diabetes"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_ischemic", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+```
+
+```{r}
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+out <- out_path
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = F
+power_thres_list = c(0.95) 
+pval_thres_list = .05
+nfold_cv = 3
+```
+
+# Any CMD 
+
+```{r}
+power_thres_list = c(0.95) 
+pval_thres_list = (.05/7)
+nfold_cv = 3
+pheno_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_anycmd_phenotype.txt"
+covar_file <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/phenotypes/EUR_inc_anycmd_covariates.txt"
+scores_file_vector <-fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_file_paths.txt", header =F)$V1 
+pgs_list1 <- fread("/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_PGS_list.txt", header = F)
+trait_specific_score_file = "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_PGS_list.txt"
+
+
+custom_pgs_list <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/prsmix_lists/inc_anycmd_PGS_list.txt"
+out_path <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/pgs_sandbox/test_EUR_inc_anycmd_"
+num_pgs <- nrow(pgs_list1)
+pheno_name <- "inc_anycmd"
+
+treatment <- NA
+categorical_vars <- c("bl_inc_cat2", "bl_educlvl_5cat", "bl_meno_status", "smoke_status_6m", "prev_anycmd","prev_anycvd", "rad_tx_yn", "anthra_yn", "tras_yn", "horm_yn")
+
+categorical_vars<- setdiff(categorical_vars, treatment)
+# Continuous variables (e.g., age, BMI, counts)
+continuous_vars <- c( "dxage", "bmi_new",  "pc_util_count")
+
+outcomes <- c("inc_anycmd", "inc_hyperten", "inc_diabetes", "inc_dyslipid", "inc_anycvd", "inc_seriouscvd", "inc_arrhythmia", "inc_hf", "inc_ischemic", "inc_stroke", "inc_vte", "inc_cvddeath")
+cat_def <- c("M","M", "M","M", "V","V","V","V", "V", "V","V", "V")
+dict <-setNames(cat_def, outcomes)
+
+
+
+if(dict[[pheno_name]]=="M"){
+  categorical_vars <- categorical_vars[categorical_vars !="prev_anycmd"]
+}else{
+  categorical_vars <-  categorical_vars[categorical_vars !="prev_anycvd"]
+}
+
+covariates <- c(categorical_vars, continuous_vars)
+```
+
+```{r}
+pheno_file <- pheno_file
+covariate_file <- covar_file
+score_files_list = scores_file_vector 
+out <- out_path
+IID_pheno = "IID" 
+covar_list = covariates
+cat_covar_list = categorical_vars
+ncores = 1
+is_extract_adjSNPeff = F
+power_thres_list = c(0.95) 
+pval_thres_list =.1
+nfold_cv = 3
+```

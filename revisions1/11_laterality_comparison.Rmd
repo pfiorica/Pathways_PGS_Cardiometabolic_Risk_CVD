@@ -1,0 +1,39 @@
+---
+title: "11_Laterality_Comparison"
+author: "Peter Fiorica"
+date: "2025-07-21"
+output: html_document
+---
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(ggsci)
+
+"%&%"=function(a,b) paste(a,b,sep="")
+
+dir <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+```
+
+# Introduction
+
+We received requests from the reviewer to analyze the laterality of breast cancer to determine if treatment has a significant interaction when stratified by laterality.
+
+> 7.	You noted that patients who received radiation did not appear to perform differently with the PRS. However, those who had right-sided breast cancer likely did not receive an appreciable amount of radiation exposure; thus, stratifying by left and right breast cancer may yield different results. If you have any cardiac dose exposure that would be even better. 
+
+```{r}
+lat_data <- readRDS(dir %&% "cvd/cvd/pgs_cohort_tumor_clean_laterality.rds")
+table(lat_data$laterality)
+
+
+```
+
+From the data above, there is nearly a 50-50 split for  tumor laterality.
+
+I made the script `12_laterality_stratification.R` to begin to stratify phenotype data for the radiation treatment to the Left-Right groups.
+
+
+Then after that, I ran `13_KPNC_call_laterality_PRSmix.sh`. From here, we will be processing the results similarly to what I have done before with the focus on diabetes.

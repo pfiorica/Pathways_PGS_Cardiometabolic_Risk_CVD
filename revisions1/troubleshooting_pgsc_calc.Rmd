@@ -1,0 +1,450 @@
+---
+title: "Troubleshooting PGSC_CALC"
+author: "Peter Fiorica"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r, echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(SNPRelate)
+library(GWASTools)
+library(snpStats)
+library(stringr)
+```
+
+# Introduction
+
+I am currently working with `pgcs_calc` to standardize my calculation of \~ 30 PGS. The issue is two fold:
+
+1)  PCA with 1000G + HGDP is disastrous and appears as though PC was calculated separately for the reference and target (Pathways) populations and then merged. This appears to be the case with the `oadp` option and `sp` for PC projection.
+
+2)  PGS Matchingness/Missiness: I have access to only a limited bit of data from Haiyang's original pipeline, but I have the matching % for the SBP and T2D PGS. It looks like I have \~.3% fewer matching SNPs in my analysis with PGSC compared to his pipeline. For diabetes, `99.92%` were matched in Haiyang's analysis compared to `99.70%` in mine.
+
+# 1. Ancestry Analysis
+
+Within the `~/work/ancestry/intersected/` directory, there are 22 files for 22 chromosomes that include those that match between the reference and target population. Let's take a look at this.
+
+```{r}
+chr_22_matching <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/work/ancestry/intersected/pathways_22_matched.txt.gz")
+
+head(chr_22_matching)
+
+
+# First, let's see how many are PCA eligible
+table(chr_22_matching$PCA_ELIGIBLE)
+```
+
+```{r}
+ref_pcs <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/fraposa/pca/GRCh37_reference_extracted.pcs", header = T)
+targ_pcs <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/fraposa/project/GRCh37_pathways_oriented_pathways_splitfamaa.pcs")
+```
+
+The majority of these SNPs (\~6/7) are PCA eligible.
+
+# 2. SNPs in PGS002308
+
+```{r}
+summary <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/results/pathways/match/pathways_log.csv")
+
+excluded_snps<- summary %>% filter(exclude==TRUE)
+unmatched_snps<- summary %>% filter(match_status == "unmatched")
+
+table(summary$match_status)
+```
+
+#### Excluded SNPs
+
+When I look up the excluded SNPS in the `.bim` files I made for pathways, I can find the first two SNPs labeled correctly in the genotypes. It appears that `match_IDs` is false for all of the excluded SNPs. This means that the matched variant is NOT found in the reference panel genotypes. If we include these variants the percent of matched variants increases to `r 100* sum(summary$match_status!="unmatched")/nrow(summary)`. It is worth exploring if I can remove this filter.
+
+#### Unmatched SNPs
+
+When we look at the unmatched SNPs, we have a multi-allelic situation for the first SNP I look up:
+
+    1       1:3103312:A:G   0       3103312 G       A
+    1       1:3103312:T:G   0       3103312 G       T
+
+# Running without Ancestry
+
+I decided to run this without ancestry, and it worked fine. \>99.92% of SNPs match.
+
+    nextflow run pgscatalog/pgsc_calc -profile singularity --input \
+        pathways_samplesheet.csv --target_build GRCh37 --keep_ambiguous FALSE --pgs_id \
+        PGS002308
+
+After this, I wanted to see if rare variants might be contributing to the issue. This did not fix the issue either (below).
+
+    ./nextflow run pgscatalog/pgsc_calc \
+        -profile singularity \
+        --input pathways_samplesheet.csv --target_build GRCh37 --pgs_id PGS002308  \
+        --run_ancestry pgsc_HGDP+1kGP_v1.tar.zst  --maf_ref 0.01 --only_projection --resume
+
+#### Exploring Reference Data More
+
+```{r, eval =FALSE}
+ref_bim <- fread("/vscratch/grp-songyao/pnfioric/pruned_refs.bim")
+table(ref_bim$V2 %in% summary$ID) #There are limited SNPs from the pruned HGDP SNPs that intersect PGS model.
+
+```
+
+# Exploring the Merging Process and genotype prep.
+
+I decided to manually merge the genotypes in plink, run PCA, and plot the results. See below.
+
+    cd /projects/rpci/songyao/pnfioric/pgs_calc/work/ancestry/filter
+
+    plink2 --pfile GRCh37_reference --make-bed --out testfile_ref
+
+    plink2 --pfile ../thinned_intersections/GRCh37_pathways_ALL_extracted  --make-bed --out test_target_pw
+
+    plink --bfile testfile_ref --bmerge test_target_pw  --make-bed --out test_merge
+
+    plink --bfile test_merge --geno 0.1 --make-bed --out test_merge_geno_filter
+
+    plink --bfile test_merge_geno_filter --pca --out merged_pca
+
+I also added and removed missingness filters to see how this would impact the PCA. It impacted it slightly, but not in the rotation we would like.
+
+```{r}
+pca_no_filt <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/combined_pva.eigenvec")
+pca_geno <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/merged_pca.eigenvec")
+
+ggplot(pca_no_filt, aes(x=V3, y= V4))+
+  geom_point(alpha=0.5)+ xlab("PC1")+ ylab("PC2")+ ggtitle("No Missingness filtering")
+
+ggplot(pca_geno, aes(x=V3, y= V4))+
+  geom_point(alpha=0.5)+ xlab("PC1")+ ylab("PC2")+ ggtitle("0.1 Missingness filtering")
+```
+
+We can see from these plots that we still have this brutal mirrored/ reflect PCA. I think this has to be related to the ways the alleles are recorded in the genotype for Pathways.
+
+# Exploring Allele Flipping & Alignment
+
+I will be using reference information from [Wang Lab wiki](https://wanggroup.org/compbio_tutorial/allele_qc.html). For every SNP in our merge there are three possible major possible issues that we can have to navigate:
+
+1)  Major/Minor Allele flipping
+
+2)  Strand Flipping
+
+3)  Strand flipping with complimentary alleles.
+
+### Manipulating 1kgp + HGDP data:
+
+The hg19/gr37 genotypes frorm 1kgp/1000G are extracted from the zipped file for pgsc_calc here: `/projects/rpci/songyao/pnfioric/pgs_calc/work/ancestry/ref_extracted/` This includes all 23M SNPs that intersect with Pathways. The `pw_bim` object includes only those SNPs that pass filters for PCA and intersect with HGDP by position.
+
+The issue is that for a substantial proportion of the SNPs, the ID is mislabeled with ALT/REF alleles flipped.
+
+```{r}
+hgdp_bim<- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/testfile_ref.bim", header = F)
+pw_bim <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/test_target_pw.bim", header=F)
+
+hgdp_filt <- hgdp_bim %>%
+  inner_join(pw_bim, by = c("V1", "V4"))
+
+hgdp_fixed <- hgdp_filt %>%
+  mutate(new_pw_id = case_when(
+    V5.x == V5.y ~ V2.y,      # If V5.x matches V5.y, assign V2.y to new_pw_id
+    V5.x == V6.y ~ V2.x,      # If V5.x matches V6.y, assign V2.x to new_pw_id
+    TRUE ~ V2.y               # Otherwise, keep it as V2.y
+  ))
+
+update_snp_list<-hgdp_fixed %>% select(V2.y, new_pw_id) %>%
+  filter(duplicated(new_pw_id)==FALSE) %>%
+  filter(duplicated(V2.y)==FALSE)
+fwrite(update_snp_list,"/projects/rpci/songyao/pnfioric/pgs_calc/work/ancestry/filter/update_list.txt", col.names = F, sep= "\t", quote = F, row.names = F)
+```
+
+In the chunk above, I generated a list of SNPs that intersect with mismatching IDs because of allele flips. Below, I update the list of ID names and remerge.
+
+    plink --bfile testfile_ref --bmerge new_names_pw  --make-bed --out test_merge
+
+    plink --bfile test_merge --geno 0.1 --make-bed --out test_merge_geno_filter
+
+    plink --bfile test_merge_geno_filter --pca --out merged_pca_updated
+
+This did not fix the PCA as shown below. I also decided to flip the signed of PC1 and PC2 for the pathways group. We still see a substantial shift to the PCA plot.
+
+```{r}
+#pca_no_filt <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/work/ancestry/filter/merged_pca_updated.eigenvec")
+pca_geno2 <- fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/merged_pca_updated.eigenvec")
+
+ggplot(pca_geno2, aes(x=V3, y= V4))+
+  geom_point(alpha=0.5)+ xlab("PC1")+ ylab("PC2")+ ggtitle("0.1 Missingness filtering (updated ID)")
+
+
+pca_geno2 <- pca_geno2 %>%
+  mutate(group = ifelse(row_number() <= 3973, "PW", "REF")) %>%
+  mutate(PC1= if_else(group=="PW", V3*-1, V3)) %>%
+  mutate(PC2= if_else(group=="PW", V4*-1, V4))
+
+ggplot(pca_geno2, aes(x=PC1, y = PC2, color = group))+
+  geom_point(alpha =0.5)+theme_bw()
+
+```
+
+I read that this inverted PC direction may result from palindromic SNPs where the alleles are A-T or G-C. Strand flips for the SNPs cannot be properly identified and corrected. When we check for these SNPs in the intersection, none are present.
+
+#### Checking for palindromic snps
+
+```{r}
+
+hgdp_fixed <- hgdp_fixed %>%
+  mutate(is_palindromic = case_when(
+    (V5.x == "A" & V6.x == "T") | (V5.x == "T" & V6.x == "A") ~ TRUE,  # Check if A ↔ T
+    (V5.x == "C" & V6.x == "G") | (V5.x == "G" & V6.x == "C") ~ TRUE,  # Check if C ↔ G
+    TRUE ~ FALSE  # If neither condition is met, return FALSE
+  ))
+
+table(hgdp_fixed$is_palindromic)
+```
+
+There are no palindromic SNPs in his data. Someone ran into a similar issue in the past in this [thread](https://github.com/meyer-lab-cshl/plinkQC/issues/25).
+
+#### Checking allele frequencies.
+
+    plink --bfile testfile_ref --freq --out ref_freq
+
+    plink --bfile new_names_pw --freq --out pw_freq
+
+```{r}
+ref_freq<-fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/ref_freq.frq")
+pw_freq <-fread("/projects/rpci/songyao/pnfioric/pgs_calc/old_work_hgdp/ancestry/filter/pw_freq.frq")
+
+total_freq <- left_join(ref_freq, pw_freq, by = "SNP")
+
+ggplot(total_freq, aes(x=MAF.x, y= MAF.y))+
+  geom_point(alpha = 0.5)+
+  geom_abline(slope = 1)+ xlab("reference MAF")+ylab("PW MAF")+theme_bw()
+
+```
+
+# Beginning with genotypes
+
+I recently re-tried pgsc_calc with only 1kGP. It gave me the same issue with the PCA. I think the issue is related to the .gds to bfile conversion. The .vcf files the were available in the adjacent folders to the .gds files were corrupted (they would force-kill plink commands mid read due to unexpected stops), but the .gds files seemed to work fine.
+
+Let's spend sometime exploring how these files are formatted and the `SNPRelate` package manages them to generate plink bfiles.
+
+```{r}
+#gdsfile <-  "/projects/rpci/qzhu/eschille/BreastGWAS/No_Y_Chrom/maf1.noHM/Input/Imputation/AllCohorts/Sample.Filtered/hrc/R2filter/GDS/chr1-1.gds"
+gdsfile <-  "/vscratch/grp-songyao/pnfioric/GDS/chr1-1.gds"
+genofile <- snpgdsOpen(gdsfile)
+snp_data <- snpgdsSNPList(genofile)
+
+#reference / non-ref alleles
+
+#snpsgdsSummary(genofile)
+
+#snpgdsGDS2PED(genofile, ped.fn = "/vscratch/grp-songyao/pnfioric/chr1.1_test")
+#snpgdsGDS2BED(genofile, bed.fn = "/vscratch/grp-songyao/pnfioric/chr1.1_test")
+
+#snp_mat <- snpgdsGetGeno(genofile)
+hist(snp_data$afreq)
+snpgdsClose(genofile)
+```
+
+```{r}
+
+gds_freq <- fread("/vscratch/grp-songyao/pnfioric/chr1_gds.frq")  %>%
+  mutate(SNP2= str_replace(SNP, "^([^:]+:[^:]+):.*", "\\1"))
+vcf_freq <- fread("/vscratch/grp-songyao/pnfioric/chr1_vcf.frq", nrows = 100000)
+
+
+joined<- left_join(gds_freq,vcf_freq, by = c("SNP2"="SNP"))
+
+ggplot(joined, aes(x = MAF.x, y = MAF.y))+
+  geom_point(alpha=0.2)
+
+head(joined)
+table(joined$MAF.x==joined$MAF.y)
+table(joined$A1.x==joined$A2.y)
+```
+
+Well, it looks like this is our issue: The VCF sourced file, which I am taking to be the ground truth, has the alt and ref alleles reported differently in the PLINK bim file compared to that sourced from the .gds file. Typically, having the allels flipped in the labeling of the SNP is not the biggest issue, but when the reported allele is mislabeled in genotypes, we run into bigger problems.
+
+This is what I think is happening in our situation: the reported allels are different, but the allele frequency is staying the same. This means that when "G" is reported as the minor allele relative to "T" at 0.08 frequency, "T" will be reported at roughly 0.92 frequency. However, the actual genotype is 0.08 "T" and 0.92 "G". I think this is happening for all genotypes and giving us our inverted PCA plot.
+
+```{r}
+
+gds_freq <- fread("/vscratch/grp-songyao/pnfioric/chr22_gds.frq")  %>%
+  mutate(SNP2= str_replace(SNP, "^([^:]+:[^:]+):.*", "\\1"))
+vcf_freq <- fread("/vscratch/grp-songyao/pnfioric/chr22_vcf.frq", nrows = 100000)
+
+
+joined<- left_join(gds_freq,vcf_freq, by = c("SNP2"="SNP"))
+
+ggplot(joined, aes(x = MAF.x, y = MAF.y))+
+  geom_point(alpha=0.2)
+
+head(joined)
+table(joined$MAF.x==joined$MAF.y)
+table(joined$A1.x==joined$A2.y)
+```
+
+If we do a second analysis of this with chromosome 22, we see that the alleles are flipped for \>99% of the SNPs.
+
+Ultimately, we need to find a way to take the dosages from the .gds files and make them into plink2 files. I believe the R code below will make a dosage file and the plink2 code below will make them into plink2 files.
+
+```{r}
+gdsFile <- "/vscratch/grp-songyao/pnfioric/GDS/chr1-1.gds"
+snpAnnotFile = "/projects/rpci/qzhu/eschille/BreastGWAS/No_Y_Chrom/maf1.noHM/Input/Imputation/AllCohorts/Sample.Filtered/hrc/R2filter/GDS/chr1-1.snp.RData"
+
+
+gds <- GdsGenotypeReader(gdsfile)
+
+# Load phenotype and SNP annotations
+samples <- getVariable(gds, "sample.id")
+load(snpAnnotFile)
+anno <- pData(snpAnnot)
+
+anno_heading <- anno %>%
+  mutate(SNP_ID=paste0(snp,":", alleleA, ":", alleleB)) %>%
+  select(SNP_ID, CHR=chromosome, POS=position, ALLELE1=alleleA, ALLELE2=alleleB)
+
+outmap <- anno_heading %>% 
+  mutate(cM= 0) %>%
+  select(CHR, SNP_ID, cM, POS)
+
+geno_out <- cbind(anno_heading, geno)
+
+colnames(geno_out)[6:ncol(geno_out)] <- paste(colnames(geno_out)[6:ncol(geno_out)], colnames(geno_out)[6:ncol(geno_out)], sep = "_")
+fwrite(geno_out, "/vscratch/grp-songyao/pnfioric/chr1.1_dosage.txt",  col.names = T, row.names = F, quote = F, sep = "\t")
+fwrite(outmap,  "/vscratch/grp-songyao/pnfioric/chr1.1_dosage.map", col.names = F, row.names = F, quote = F, sep = "\t")
+close(gdsFile)
+```
+
+    plink2 --import-dosage chr1.1_dosage.txt id-delim=_ skip0=0 skip1=2 skip2=0 --map chr1.1_dosage.map --fam chr22_test.fam 
+
+    ls *.pgen *.pvar *.psam *.log | sort | uniq | awk -F"-" '{print $1}' | grep -E "^chr([1-9]|1[0-9]|2[0-2])$" | uniq | while read chr; do
+      # Create the output file for each chromosome
+      output_file="${chr}_list.txt"
+      
+      # Get the unique file prefixes for this chromosome (keeping _updated_pw)
+      ls ${chr}-*.* | sed 's/\.[^.]*$//' | sort | uniq > "$output_file"
+    done
+
+    plink2 --pmerge-list chr
+
+```{r, eval = FALSE}
+file_list <- fread("/vscratch/grp-songyao/pnfioric/temp_genos/plink2/file_list.txt", header = F)
+
+samplesheet <- file_list %>%
+  mutate(sampleset = "pathways") %>%
+  mutate(path_prefix = paste0("/projects/rpci/songyao/pnfioric/pgs_calc/pgsmix/pw_genotypes_plink2/", V1))%>%
+  mutate(path_prefix = str_remove(path_prefix, ".log")) %>%
+  mutate(chrom = as.integer(str_extract(V1, "\\d+"))) %>%
+  mutate(format="pfile") %>% arrange(chrom) %>% select(-V1)
+
+fwrite(samplesheet, "/projects/rpci/songyao/pnfioric/pgs_calc/pathways_samplesheet2.csv", col.names = T, row.names = F, sep = ",", quote = F)
+```
+
+        salloc --qos=general-compute --partition=general-compute  --job-name "PGSC_CALC2" --mem=64G --nodes 2 --ntasks=1 --cpus-per-task=8 --time=03:30:00  
+
+    nextflow run pgscatalog/pgsc_calc \
+        -profile singularity \
+        --input pathways_samplesheet2.csv --target_build GRCh37 \
+        --pgs_id  PGS000677,PGS000699,PGS000688 \
+        --outdir output_dir
+        #--run_ancestry pgsc_HGDP+1kGP_v1.tar.zst --n_popcomp 5
+
+    Now, I should scale it up for the job to be submitted in slurm:
+
+        ./nextflow run pgscatalog/pgsc_calc \
+            -profile singularity \
+            --input pathways_samplesheet2.csv --target_build GRCh37 \
+            --pgs_id  PGS000677,PGS000699,PGS000688,PGS000686,PGS000671,PGS000672,PGS000689,PGS000675,PGS002807,PGS001133,PGS000684,PGS000305,PGS000306,PGS000685,PGS001228,PGS000716,PGS001227,PGS001101,PGS001230,PGS002308,PGS000709,PGS000710,PGS000703,PGS000900,PGS000331,PGS000039,PGS003725,PGS003356,PGS003446,PGS000329,PGS001134,PGS000330 \
+            --run_ancestry pgsc_HGDP+1kGP_v1.tar.zst --n_popcomp 5
+
+## 3. Errors with `PGSCATALOG_PGSCCALC:PGSCCALC:APPLY_SCORE:PLINK2_SCORE`
+
+In the execution trace, `execution_trace_2025-01-08_16-03-06.txt`, the nextflow job for only PGS_SCORE calculation yields an error at
+
+    73      98/2e7ae3       572647  PGSCATALOG_PGSCCALC:PGSCCALC:APPLY_SCORE:PLINK2_SCORE (pathways chromosome 11 effect type additive 1)   FAILED  1       2025-01-08 17:06:09.614
+
+The chromosome number varies across different jobs, but the error occurs for only large PGS files:
+
+| **PGS \#** | **Number of variants** |
+|:----------:|:----------------------:|
+| PGS000330  |       6,437,380        |
+| PGS000329  |       6,423,165        |
+| PGS000331  |       6,183,494        |
+| PGS000039  |       3,225,583        |
+| PGS003356  |       2,324,683        |
+
+When I check the working directory, it appears that the command in `.command.sh` is the following:
+
+    #!/bin/bash -euo pipefail
+    plink2             --threads 2             --memory 8192             --seed 31             --extract pathways_11_additive_1.scorefile.gz                          --allow-extra-chr             --score pathways_11_additive_1.scorefile.gz zs header-read cols=+scoresums,+denom,+fid list-variants                 --score-col-nums 3-30             --pfile vzs GRCh37_pathways_11             --out pathways_11_additive_1
+
+    n_missing=$(comm -3 <(zcat --force pathways_11_additive_1.scorefile.gz | tail -n +2 | cut -f 1 | sort) <(sort pathways_11_additive_1.sscore.vars) | wc -l | tr -d ' ')
+
+    if [ $n_missing -gt 0 ]
+    then
+      echo "ERROR: $n_missing variant(s) missing from final calculated score!"
+      exit 1
+    else
+      echo "INFO: Scoring file variants match listed variants in sscore.vars"
+    fi
+
+    cat <<-END_VERSIONS > versions.yml
+    PLINK2_SCORE:
+        plink2: $(plink2 --version 2>&1 | sed 's/^PLINK v//; s/ 64.*$//' )
+    END_VERSIONS
+
+I ran the first plink command in this code. It appears to have run properly with results written to
+
+    pathways_11_additive_1.log
+    pathways_11_additive_1.sscore.vars
+    pathways_11_additive_1.sscore.zst
+
+When I run the `n_missing` definition command and then `echo $n_missing`, I get `0` as the output.
+
+When I run the if statement, I get `INFO: Scoring file variants match listed variants in sscore.vars`.
+
+All the commands to appear to work fine. When I check the .command.err file, it reads:
+
+    INFO:    Environment variable SINGULARITYENV_TMPDIR is set, but APPTAINERENV_TMPDIR is preferred
+    INFO:    Environment variable SINGULARITYENV_NXF_TASK_WORKDIR is set, but APPTAINERENV_NXF_TASK_WORKDIR is preferred
+    INFO:    Environment variable SINGULARITYENV_NXF_DEBUG is set, but APPTAINERENV_NXF_DEBUG is preferred
+    sort: cannot create temporary file in '/scratch/18214737': No such file or directory
+
+Given that this is happening only for large PGS, I anticipate this may be a disk space issue...
+
+~~I tracked down the scratch directory that it giving the error. This is created for each job that is submitted to SLURM on the HPC. The issue is that there is one per job, so it can fill up quickly without informing the user. It likely is removed after it fills up I imagine.~~
+
+~~---I screwed around with the configuration file for Nextflow a few times, but I ultimately got it to work. I would like to thank the folks on this forum:---~~
+
+-   [~~https://www.unix.com/shell-programming-and-scripting/177259-sort-cannot-create-tempory-file.html~~](https://www.unix.com/shell-programming-and-scripting/177259-sort-cannot-create-tempory-file.html){.uri}
+
+~~These are also helpful links for navigating the configuration files on HPCs. \* <https://seqera.io/blog/5_tips_for_hpc_users/> \*<https://pgsc-calc.readthedocs.io/en/latest/how-to/bigjob.html>~~
+
+### Previous documentation of the issue
+
+It looks like this issue with the scratch directory has previously been documented with nextflow:
+
+[scratch directive does not work · Issue #1280 · nextflow-io/nextflow · GitHub](https://github.com/nextflow-io/nextflow/issues/1280)
+
+It has also been partially documented with pgsc_calc:
+
+[Docker inside of Docker: /bin/bash: .command.run: No such file or directory · Issue #242 · PGScatalog/pgsc_calc · GitHub](https://github.com/PGScatalog/pgsc_calc/issues/242)
+
+I tried solving this on my own by editing the configuration file and using `sort- T` instead, but these did not solve the issue.
+
+## CCR Help
+
+I ultimately reached out to CCR to see if they could help me with this issue. (See emails from 1/9 and 1/10/2025
+
+The response I received was: \>Looking over this ticket, it looks not so much as a limit problem when writing to a scratch directory, but an access problem to the scratch directories from the container. Are you about to bind mount the scratch directories when launching the container? Here are some instructions. <https://docs.sylabs.io/guides/3.0/user-guide/bind_paths_and_mounts.html> Let me know how this works and if I i need to dig deeper, I can.
+
+    export SINGULARITYENV_LOCALCACHEDIR=/projects/rpci/songyao/pnfioric/tmp
+    export SINGULARITYENV_CACHEDIR=/projects/rpci/songyao/pnfioric/tmp
+    export SINGULARITYENV_TMPDIR=/projects/rpci/songyao/pnfioric/tmp
+
+    export APPTAINER_LOCALCACHEDIR=/projects/rpci/songyao/pnfioric/tmp
+    export APPTAINER_CACHEDIR=/projects/rpci/songyao/pnfioric/tmp
+    export APPTAINER_TMPDIR=/projects/rpci/songyao/pnfioric/tmp
+
+# Solution
+
+I ended up uninstalling and completely removing nextflow asset in `/user/pnfioric/.nextflow/assets/pgs_catalog/pgsc_calc/`. From here, I reinstalled the most up-to-date version, and it appears to be running properly. This appears to run correctly. Please go to `/projects/rpci/songyao/pnfioric/pgs_calc/pgsmix/pgs_paper-revisions/PGS_Processing.Rmd` for next steps. 

@@ -1,0 +1,42 @@
+---
+title: "Table 1"
+author: "Peter fiorica"
+date: "2025-05-23"
+output: html_document
+---
+
+```{r, echo = FALSE}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(readxl)
+library(ggplot2)
+library(ggsci)
+library(stringr)
+library(forcats)
+library(gtsummary)
+
+"%&%"=function(a,b) paste(a,b,sep="")
+
+dir <- "/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+pgs_dir<-"/bd-fs-mnt/TenantShare/exthome/home/l578311/"
+```
+
+```{r}
+input <- readRDS("cvd/pgs_revised/data/final_cohorts/pgs_zscores_overall_peter.rds")
+```
+
+
+```{r}
+input %>% 
+  mutate(age_cat = cut(dxage,
+    breaks = c(-Inf, 39, 49, 59, 69, Inf),
+    labels = c("<40", "40-49", "50-59", "60-69", "≥70")
+  )) %>%
+  mutate(bmi_cat = cut(bmi_new,
+    breaks = c(-Inf, 19.9, 25.0, 30.0, 35,40.0, Inf),
+    labels = c("<20", "20.1-25.0", "25.1-30.0", "30.1-35.0", "35.1-40.0", ">40")
+  )) %>%
+  select(age_cat, bl_meno_status, race, bmi_cat, ancestry, chemo_inf_yn, rad_tx_yn, horm_yn, tras_yn ) %>%
+  tbl_summary(digits = list(age_cat=1, bl_meno_status=1, race=1, bmi_cat=1, ancestry=1, chemo_inf_yn=1, rad_tx_yn=1, horm_yn=1, tras_yn=1 ))
+```
